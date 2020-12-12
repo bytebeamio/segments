@@ -100,7 +100,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// data is not of active segment. Set your max_segment size keeping tail
     /// latencies of all the concurrent connections mind
     /// (some runtimes support internal preemption using await points)
-    pub fn readv(&mut self, segment: u64, offset: u64) -> (Option<u64>, u64, u64, Vec<T>) {
+    pub fn readv(&mut self, segment: u64, offset: u64, out: &mut Vec<T>) -> (Option<u64>, u64, u64) {
         let mut base_offset = segment;
         let mut offset = offset;
 
@@ -116,20 +116,19 @@ impl<T: Debug + Clone> MemoryLog<T> {
             // read from active segment if base offset matches active segment's base offset
             if base_offset == self.active_segment.base_offset() {
                 let relative_offset = (offset - base_offset) as usize;
-                let out = self.active_segment.readv(relative_offset);
+                self.active_segment.readv(relative_offset, out);
                 let next_record_offset = offset + out.len() as u64;
                 break (
                     None,
                     self.active_segment.base_offset(),
                     next_record_offset,
-                    out,
                 );
             }
 
             // read from backlog segments
             if let Some(segment) = self.segments.get(&base_offset) {
                 let relative_offset = (offset - base_offset) as usize;
-                let out = segment.readv(relative_offset);
+                segment.readv(relative_offset, out);
 
                 if !out.is_empty() {
                     let next_record_offset = offset + out.len() as u64;
@@ -138,7 +137,6 @@ impl<T: Debug + Clone> MemoryLog<T> {
                         Some(next_segment_offset),
                         segment.base_offset(),
                         next_record_offset,
-                        out,
                     );
                 } else {
                     // Jump to the next segment if the above readv return 0 element
@@ -226,8 +224,9 @@ mod test {
             log.append(payload.len(), payload);
         }
 
+        let mut data = Vec::new();
         // Read a segment from start. This returns full segment
-        let (jump, base_offset, next_offset, data) = log.readv(0, 0);
+        let (jump, base_offset, next_offset) = log.readv(0, 0, &mut data);
         assert_eq!(data.len(), 10);
         assert_eq!(base_offset, 0);
         assert_eq!(next_offset, 10);
@@ -240,7 +239,8 @@ mod test {
         assert_eq!(data[0], 50);
 
         // Read a segment from the middle. This returns all the remaining elements
-        let (jump, base_offset, next_offset, data) = log.readv(10, 15);
+        let mut data = Vec::new();
+        let (jump, base_offset, next_offset) = log.readv(10, 15, &mut data);
         assert_eq!(data.len(), 5);
         assert_eq!(base_offset, 10);
         assert_eq!(next_offset, 20);
@@ -249,11 +249,13 @@ mod test {
         assert_eq!(jump, Some(20));
 
         // Read a segment from scratch. gets full segment
-        let (_, _, _, data) = log.readv(10, 10);
+        let mut data = Vec::new();
+        let (_, _, _) = log.readv(10, 10, &mut data);
         assert_eq!(data.len(), 10);
 
         // Read a segment from middle. gets full segment from middle
-        let (_, _, _, data) = log.readv(10, 15);
+        let mut data = Vec::new();
+        let (_, _, _) = log.readv(10, 15, &mut data);
         assert_eq!(data.len(), 5);
     }
 
@@ -270,7 +272,8 @@ mod test {
         }
 
         // read active segment
-        let (jump, segment, offset, data) = log.readv(190, 190);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(190, 190, &mut data);
         assert_eq!(data.len(), 10);
         assert_eq!(segment, 190);
         assert_eq!(offset, 200);
@@ -291,7 +294,8 @@ mod test {
         }
 
         // read active segment
-        let (jump, segment, offset, data) = log.readv(80, 80);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(80, 80, &mut data);
         assert_eq!(data.len(), 5);
         assert_eq!(segment, 80);
         assert_eq!(offset, 85);
@@ -304,7 +308,8 @@ mod test {
         }
 
         // read active segment
-        let (jump, segment, offset, data) = log.readv(segment, offset);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
         assert_eq!(data.len(), 5);
         assert_eq!(segment, 80);
         assert_eq!(offset, 90);
@@ -325,7 +330,8 @@ mod test {
 
         // read active segment. there's no next segment. so active segment
         // is not done yet
-        let (jump, segment, offset, data) = log.readv(80, 80);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(80, 80, &mut data);
         assert_eq!(data.len(), 10);
         assert_eq!(segment, 80);
         assert_eq!(offset, 90);
@@ -338,14 +344,16 @@ mod test {
         }
 
         // read from the next offset of previous active segment
-        let (jump, segment, offset, data) = log.readv(segment, offset);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
         assert_eq!(data.len(), 10);
         assert_eq!(segment, 90);
         assert_eq!(offset, 100);
         assert_eq!(jump, Some(100));
 
         // read active segment again
-        let (jump, segment, offset, data) = log.readv(segment, offset);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
         assert_eq!(data.len(), 10);
         assert_eq!(segment, 100);
         assert_eq!(offset, 110);
@@ -366,7 +374,8 @@ mod test {
 
         // Read 15K. Crosses boundaries of the segment and offset will be in
         // the middle of 2nd segment
-        let (jump, segment, offset, _data) = log.readv(0, 0);
+        let mut data = Vec::new();
+        let (jump, segment, offset) = log.readv(0, 0, &mut data);
         assert_eq!(segment, 100);
         assert_eq!(offset, 110);
         assert_eq!(jump, Some(110));

@@ -52,16 +52,7 @@ impl<T: Debug + Clone> Segment<T> {
     }
 
     /// Reads multiple data from an offset to the end of segment
-    pub fn readv(&self, offset: usize) -> Vec<T> {
-        // let end = match self.file.len() {
-        //     // Requested offset crosses segment boundary
-        //     len if offset > len => return Vec::new(),
-        //     // End offset crosses boundary when trying fetch requested max count
-        //     len if offset + max_count > len => len,
-        //     // Return maximum number of elements
-        //     _ => offset + max_count,
-        // };
-
-        self.file[offset..].to_vec()
+    pub fn readv(&self, offset: usize, out: &mut Vec<T>) {
+        out.extend_from_slice(&self.file[offset..])
     }
 }
