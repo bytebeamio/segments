@@ -9,6 +9,7 @@ use std::mem;
 /// It drops the oldest segment when retention policies are crossed.
 /// Each segment is identified by base offset and a new segment is created
 /// when ever current segment crosses disk limit
+#[derive(Debug)]
 pub struct MemoryLog<T> {
     /// Offset of the last appended record
     head_offset: u64,
@@ -43,22 +44,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// writes the record to it.
     /// This function also handles retention by removing head segment
     pub fn append(&mut self, size: usize, record: T) -> (u64, u64) {
-        let mut switch = false;
-        if self.active_segment.size() >= self.max_segment_size {
-            let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
-            let last_active = mem::replace(&mut self.active_segment, Segment::new(next_offset));
-            self.segments.insert(last_active.base_offset(), last_active);
-            switch = true;
-
-            // if backlog + active segment count is greater than max segments,
-            // delete first segment and update head
-            if self.segments.len() + 1 > self.max_segments {
-                if let Some(segment) = self.segments.remove(&self.head_offset) {
-                    self.head_offset = segment.base_offset() + segment.len() as u64;
-                }
-            }
-        }
-
+        let switch = self.apply_retention();
         let base_offset = self.active_segment.base_offset();
         let offset = self.active_segment.append(record, size);
 
@@ -68,6 +54,26 @@ impl<T: Debug + Clone> MemoryLog<T> {
         }
 
         (base_offset, offset)
+    }
+
+    fn apply_retention(&mut self) -> bool {
+        if self.active_segment.size() >= self.max_segment_size {
+            let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
+            let last_active = mem::replace(&mut self.active_segment, Segment::new(next_offset));
+            self.segments.insert(last_active.base_offset(), last_active);
+
+            // if backlog + active segment count is greater than max segments,
+            // delete first segment and update head
+            if self.segments.len() + 1 > self.max_segments {
+                if let Some(segment) = self.segments.remove(&self.head_offset) {
+                    self.head_offset = segment.base_offset() + segment.len() as u64;
+                }
+            }
+
+            return true
+        }
+
+        false
     }
 
     pub fn next_offset(&self) -> (u64, u64) {
@@ -100,7 +106,12 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// data is not of active segment. Set your max_segment size keeping tail
     /// latencies of all the concurrent connections mind
     /// (some runtimes support internal preemption using await points)
-    pub fn readv(&mut self, segment: u64, offset: u64, out: &mut Vec<T>) -> (Option<u64>, u64, u64) {
+    pub fn readv(
+        &mut self,
+        segment: u64,
+        offset: u64,
+        out: &mut Vec<T>,
+    ) -> (Option<u64>, u64, u64) {
         let mut base_offset = segment;
         let mut offset = offset;
 
@@ -118,11 +129,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
                 let relative_offset = (offset - base_offset) as usize;
                 self.active_segment.readv(relative_offset, out);
                 let next_record_offset = offset + out.len() as u64;
-                break (
-                    None,
-                    self.active_segment.base_offset(),
-                    next_record_offset,
-                );
+                break (None, self.active_segment.base_offset(), next_record_offset);
             }
 
             // read from backlog segments

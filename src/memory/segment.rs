@@ -5,6 +5,7 @@ use std::fmt::Debug;
 /// the file as seek on buffer reader will dump the buffer anyway
 /// Also multiple readers might be operating on a given segment
 /// which makes the cursor movement very dynamic
+#[derive(Debug)]
 pub struct Segment<T> {
     base_offset: u64,
     size: usize,
