@@ -42,21 +42,25 @@ impl<T: Debug + Clone> MemoryLog<T> {
         }
     }
 
+    pub fn head_and_tail(&self) -> (u64, u64) {
+        (self.head_offset, self.tail_offset)
+    }
+
     /// Appends this record to the tail and returns the offset of this append.
     /// When the current segment is full, this also create a new segment and
     /// writes the record to it.
     /// This function also handles retention by removing head segment
     pub fn append(&mut self, size: usize, record: T) -> (u64, u64) {
         let switch = self.apply_retention();
-        let base_offset = self.active_segment.base_offset();
+        let segment_id = self.tail_offset;
         let offset = self.active_segment.append(record, size);
 
         // For debugging during flux. Will be removed later
         if switch {
-            // println!("swch. segment = {}, next_offset = {}", base_offset, offset);
+            // println!("swch. segment = {}, next_offset = {}", segment_id, offset);
         }
 
-        (base_offset, offset)
+        (segment_id, offset)
     }
 
     fn apply_retention(&mut self) -> bool {
@@ -81,9 +85,9 @@ impl<T: Debug + Clone> MemoryLog<T> {
     }
 
     pub fn next_offset(&self) -> (u64, u64) {
-        let base_offset = self.active_segment.base_offset();
-        let relative_offset = base_offset + self.active_segment.len() as u64;
-        (base_offset, relative_offset)
+        let segment_id = self.tail_offset;
+        let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
+        (segment_id, next_offset)
     }
 
     /// Read a record from correct segment
