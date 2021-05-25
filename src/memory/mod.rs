@@ -11,8 +11,10 @@ use std::mem;
 /// when ever current segment crosses disk limit
 #[derive(Debug)]
 pub struct MemoryLog<T> {
-    /// Offset of the last appended record
+    /// Offset of the first segment
     head_offset: u64,
+    /// Offset of the last segment
+    tail_offset: u64,
     /// Maximum size of a segment
     max_segment_size: usize,
     /// Maximum number of segments
@@ -32,6 +34,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
 
         MemoryLog {
             head_offset: 0,
+            tail_offset: 0,
             max_segment_size,
             max_segments,
             segments: FnvHashMap::default(),
@@ -60,17 +63,18 @@ impl<T: Debug + Clone> MemoryLog<T> {
         if self.active_segment.size() >= self.max_segment_size {
             let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
             let last_active = mem::replace(&mut self.active_segment, Segment::new(next_offset));
-            self.segments.insert(last_active.base_offset(), last_active);
+            self.segments.insert(self.tail_offset, last_active);
+            self.tail_offset += 1;
 
             // if backlog + active segment count is greater than max segments,
             // delete first segment and update head
             if self.segments.len() + 1 > self.max_segments {
-                if let Some(segment) = self.segments.remove(&self.head_offset) {
-                    self.head_offset = segment.base_offset() + segment.len() as u64;
+                if self.segments.remove(&self.head_offset).is_some() {
+                    self.head_offset += 1;
                 }
             }
 
-            return true
+            return true;
         }
 
         false
@@ -83,68 +87,56 @@ impl<T: Debug + Clone> MemoryLog<T> {
     }
 
     /// Read a record from correct segment
-    pub fn read(&mut self, base_offset: u64, offset: usize) -> Option<T> {
-        if base_offset == self.active_segment.base_offset() {
-            return self.active_segment.read(offset as usize);
+    pub fn read(&mut self, cursor: (u64, u64)) -> Option<T> {
+        if cursor.0 == self.tail_offset {
+            return self.active_segment.read(cursor.1);
         }
 
-        match self.segments.get_mut(&base_offset) {
-            Some(segment) => segment.read(offset),
+        match self.segments.get(&cursor.0) {
+            Some(segment) => segment.read(cursor.1),
             None => None,
         }
     }
 
     /// Reads multiple packets from the disk and returns base offset and
     /// offset of the next log.
-    /// 1st return = Done status is used by the caller to jump to next segment.
     /// When data of deleted segment is asked, returns data of the current head
-    /// **Note**: Base offset is used to be able to pull directly from correct
-    /// segment instead of
-    /// **Note**: Uses an explicit index to identify correct segment. Kafka
-    /// clients just use absolute
+    /// **Note**: segment id is used to be able to pull directly from correct segment
     /// **Note**: This method also returns full segment data when requested
     /// data is not of active segment. Set your max_segment size keeping tail
     /// latencies of all the concurrent connections mind
     /// (some runtimes support internal preemption using await points)
-    pub fn readv(
-        &mut self,
-        segment: u64,
-        offset: u64,
-        out: &mut Vec<T>,
-    ) -> (Option<u64>, u64, u64) {
-        let mut base_offset = segment;
-        let mut offset = offset;
-
+    pub fn readv(&mut self, mut cursor: (u64, u64), out: &mut Vec<T>) -> Option<(u64, u64)> {
         // TODO Fix usize to u64 conversions
         // jump to head if the caller is trying to read deleted segment
-        if base_offset < self.head_offset {
+        if cursor.0 < self.head_offset {
             warn!("Trying to read a deleted segment. Jumping");
-            base_offset = self.head_offset;
-            offset = self.head_offset;
+            cursor = (self.head_offset, self.head_offset)
         }
 
         loop {
             // read from active segment if base offset matches active segment's base offset
-            if base_offset == self.active_segment.base_offset() {
-                let relative_offset = (offset - base_offset) as usize;
-                self.active_segment.readv(relative_offset, out);
-                let next_record_offset = offset + out.len() as u64;
-                break (None, self.active_segment.base_offset(), next_record_offset);
+            if cursor.0 == self.tail_offset {
+                self.active_segment.readv(cursor.1, out);
+                // Return None if there is no data. Router will park the data request with
+                // this cursor to resume when there is more data
+                if out.is_empty() {
+                    break None;
+                }
+
+                cursor.1 += out.len() as u64;
+                break Some(cursor);
             }
 
             // read from backlog segments
-            if let Some(segment) = self.segments.get(&base_offset) {
-                let relative_offset = (offset - base_offset) as usize;
-                segment.readv(relative_offset, out);
+            if let Some(segment) = self.segments.get(&cursor.0) {
+                segment.readv(cursor.1, out);
 
                 if !out.is_empty() {
-                    let next_record_offset = offset + out.len() as u64;
-                    let next_segment_offset = segment.base_offset() + segment.len() as u64;
-                    break (
-                        Some(next_segment_offset),
-                        segment.base_offset(),
-                        next_record_offset,
-                    );
+                    // We always read full segment. So we can always jump to next segment
+                    cursor.0 += 1;
+                    cursor.1 += out.len() as u64;
+                    break (Some(cursor));
                 } else {
                     // Jump to the next segment if the above readv return 0 element
                     // because of just being at the edge before next segment got
@@ -153,8 +145,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
                     // return data if there is data. Or else router registers this
                     // for notification even though there is data (which might
                     // cause a block)
-                    base_offset = segment.base_offset() + segment.len() as u64;
-                    offset = base_offset;
+                    cursor.0 += 1;
                     continue;
                 };
             }
@@ -172,8 +163,8 @@ mod test {
         let mut log = MemoryLog::new(10 * 1024, 10);
 
         // 200 1K iterations. 10 1K records per file. 20 files ignoring deletes.
-        // segments: 0.segment, 10.segment .... 190.segment
-        // considering deletes: 100.segment, 110.segment .. 190.segment
+        // segments: 0.segment (0 - 9), 1.segment (10 -19) .... 19.segment (190 - 200)
+        // considering deletes: 10.segment, 11.segment .. 19.segment
         for i in 0..200 {
             let payload = vec![i; 1024];
             log.append(payload.len(), payload);
@@ -186,36 +177,39 @@ mod test {
             log.append(payload.len(), payload);
         }
 
-        let data = log.read(90, 0);
+        let data = log.read((9, 0));
         assert!(data.is_none());
 
-        // considering: 100.segment (100-109) .. 190.segment (190-199)
-        // read segment with base offset 110
+        // considering: 10.segment (100-109) .. 19.segment (190-199)
+        // read segment with base offset 11
+        let segment_id = 11;
         let base_offset = 110;
         for i in 0..10 {
-            let data = log.read(base_offset, i).unwrap();
+            let data = log.read((segment_id, base_offset + i)).unwrap();
             let d = base_offset as u8 + i as u8;
             assert_eq!(data[0], d);
         }
 
         // read segment with base offset 190 (1 last segment before
         // semi filled segment)
+        let segment_id = 19;
         let base_offset = 190;
         for i in 0..10 {
-            let data = log.read(base_offset, i).unwrap();
+            let data = log.read((segment_id, base_offset + i)).unwrap();
             let d = base_offset as u8 + i as u8;
             assert_eq!(data[0], d);
         }
 
         // read 200.segment which is semi filled with 5 records
+        let segment_id = 20;
         let base_offset = 200;
         for i in 0..5 {
-            let data = log.read(base_offset, i).unwrap();
+            let data = log.read((segment_id, base_offset + i)).unwrap();
             let d = base_offset as u8 + i as u8;
             assert_eq!(data[0], d);
         }
 
-        let data = log.read(base_offset, 5);
+        let data = log.read((20, base_offset + 5));
         assert!(data.is_none());
     }
 
@@ -223,8 +217,8 @@ mod test {
     fn vectored_read_works_as_expected() {
         let mut log = MemoryLog::new(10 * 1024, 10);
 
-        // 90 1K iterations. 10 files ignoring deletes.
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 80.segment (80 - 89)
+        // 90 1K iterations. 10 files
+        // 0.segment (data with 0 - 9), 1.segment (10 - 19) .... 8.segment (80 - 89)
         // 10K per segment = 10 records per segment
         for i in 0..90 {
             let payload = vec![i; 1024];
@@ -233,37 +227,29 @@ mod test {
 
         let mut data = Vec::new();
         // Read a segment from start. This returns full segment
-        let (jump, base_offset, next_offset) = log.readv(0, 0, &mut data);
+        let next = log.readv((0, 0), &mut data);
         assert_eq!(data.len(), 10);
-        assert_eq!(base_offset, 0);
-        assert_eq!(next_offset, 10);
-        assert_eq!(data[base_offset as usize][0], 0);
+        assert_eq!(next, Some((1, 10)));
+        assert_eq!(data[0][0], 0);
         assert_eq!(data[data.len() - 1][0], 9);
-        assert_eq!(jump, Some(10));
 
-        // Read 50.segment offset 0
-        let data = log.read(50, 0).unwrap();
+        // Read 5.segment
+        let data = log.read((5, 50)).unwrap();
         assert_eq!(data[0], 50);
 
         // Read a segment from the middle. This returns all the remaining elements
         let mut data = Vec::new();
-        let (jump, base_offset, next_offset) = log.readv(10, 15, &mut data);
+        let next = log.readv((1, 15), &mut data);
         assert_eq!(data.len(), 5);
-        assert_eq!(base_offset, 10);
-        assert_eq!(next_offset, 20);
+        assert_eq!(next, Some((2, 20)));
         assert_eq!(data[0][0], 15);
         assert_eq!(data[data.len() - 1][0], 19);
-        assert_eq!(jump, Some(20));
 
         // Read a segment from scratch. gets full segment
         let mut data = Vec::new();
-        let (_, _, _) = log.readv(10, 10, &mut data);
+        let next = log.readv((1, 10), &mut data);
         assert_eq!(data.len(), 10);
-
-        // Read a segment from middle. gets full segment from middle
-        let mut data = Vec::new();
-        let (_, _, _) = log.readv(10, 15, &mut data);
-        assert_eq!(data.len(), 5);
+        assert_eq!(next, Some((2, 20)));
     }
 
     #[test]
@@ -271,20 +257,18 @@ mod test {
         let mut log = MemoryLog::new(10 * 1024, 10);
 
         // 200 1K iterations. 10 1K records per file. 20 files ignoring deletes.
-        // segments: 0.segment, 10.segment .... 190.segment
-        // considering deletes: 100.segment .. 190.segment
+        // segments: 0.segment, 1.segment .... 19.segment
+        // considering deletes: 10.segment .. 19.segment
         for i in 0..200 {
             let payload = vec![i; 1024];
             log.append(payload.len(), payload);
         }
 
-        // read active segment
+        // Read active segment. Next shouldn't jump to next segment
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(190, 190, &mut data);
+        let next = log.readv((19, 190), &mut data);
         assert_eq!(data.len(), 10);
-        assert_eq!(segment, 190);
-        assert_eq!(offset, 200);
-        assert!(jump.is_none());
+        assert_eq!(next, Some((19, 200)));
     }
 
     #[test]
@@ -292,9 +276,9 @@ mod test {
         let mut log = MemoryLog::new(10 * 1024, 10);
 
         // 85 1K iterations. 10 files
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 80.segment (80 - 84)
+        // 0.segment (data with 0 - 9), 1.segment (10 - 19) .... 8.segment (80 - 84)
         // 10 records per segment (1K each)
-        // segment 80 is semi filled
+        // 8.segment is semi filled
         for i in 0..85 {
             let payload = vec![i; 1024];
             log.append(payload.len(), payload);
@@ -302,11 +286,9 @@ mod test {
 
         // read active segment
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(80, 80, &mut data);
+        let next = log.readv((8, 80), &mut data);
         assert_eq!(data.len(), 5);
-        assert_eq!(segment, 80);
-        assert_eq!(offset, 85);
-        assert!(jump.is_none());
+        assert_eq!(next, Some((8, 85)));
 
         // fill active segment more
         for i in 85..90 {
@@ -316,11 +298,14 @@ mod test {
 
         // read active segment
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
+        let next = log.readv(next.unwrap(), &mut data);
         assert_eq!(data.len(), 5);
-        assert_eq!(segment, 80);
-        assert_eq!(offset, 90);
-        assert!(jump.is_none());
+        assert_eq!(next, Some((8, 90)));
+
+        let mut data = Vec::new();
+        let next = log.readv(next.unwrap(), &mut data);
+        assert_eq!(data.len(), 0);
+        assert!(next.is_none());
     }
 
     #[test]
@@ -328,7 +313,7 @@ mod test {
         let mut log = MemoryLog::new(10 * 1024, 10);
 
         // 90 1K iterations. 9 files ignoring deletes.
-        // 0.segment (data with 0 - 9), 10.segment .... 80.segment (80 - 89)
+        // 0.segment (data with 0 - 9), 1.segment .... 8.segment (80 - 89)
         // 10K per segment = 10 records per segment
         for i in 0..90 {
             let payload = vec![i; 1024];
@@ -338,11 +323,9 @@ mod test {
         // read active segment. there's no next segment. so active segment
         // is not done yet
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(80, 80, &mut data);
+        let next = log.readv((8, 80), &mut data);
         assert_eq!(data.len(), 10);
-        assert_eq!(segment, 80);
-        assert_eq!(offset, 90);
-        assert!(jump.is_none());
+        assert_eq!(next, Some((8, 90)));
 
         // append more which also changes active segment to 100.segment
         for i in 90..110 {
@@ -352,39 +335,20 @@ mod test {
 
         // read from the next offset of previous active segment
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
+        let next = log.readv(next.unwrap(), &mut data);
         assert_eq!(data.len(), 10);
-        assert_eq!(segment, 90);
-        assert_eq!(offset, 100);
-        assert_eq!(jump, Some(100));
+        assert_eq!(next, Some((10, 100)));
 
         // read active segment again
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(segment, offset, &mut data);
+        let next = log.readv(next.unwrap(), &mut data);
         assert_eq!(data.len(), 10);
-        assert_eq!(segment, 100);
-        assert_eq!(offset, 110);
-        assert!(jump.is_none());
-    }
+        assert_eq!(next, Some((10, 110)));
 
-    #[test]
-    fn vectored_reads_reports_jumps_at_boundary() {
-        let mut log = MemoryLog::new(10 * 1024, 10);
-
-        // 200 1K iterations. 10 1K records per file. 20 files ignoring deletes
-        // segments: 0.segment, 10.segment .... 190.segment
-        // considering deletes: 100.segment, 110.segment .. 190.segment
-        for i in 0..200 {
-            let payload = vec![i; 1024];
-            log.append(payload.len(), payload);
-        }
-
-        // Read 15K. Crosses boundaries of the segment and offset will be in
-        // the middle of 2nd segment
+        // read again when there is no more data
         let mut data = Vec::new();
-        let (jump, segment, offset) = log.readv(0, 0, &mut data);
-        assert_eq!(segment, 100);
-        assert_eq!(offset, 110);
-        assert_eq!(jump, Some(110));
+        let next = log.readv(next.unwrap(), &mut data);
+        assert_eq!(data.len(), 0);
+        assert!(next.is_none());
     }
 }

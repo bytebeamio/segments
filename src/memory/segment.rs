@@ -44,16 +44,26 @@ impl<T: Debug + Clone> Segment<T> {
         self.base_offset + self.file.len() as u64
     }
 
-    /// Reads to fill the complete buffer. Returns number of bytes reamodd
-    pub fn read(&mut self, offset: usize) -> Option<T> {
-        match self.file.get(offset) {
+    /// Reads at an absolute offset
+    pub fn read(&self, offset: u64) -> Option<T> {
+        if offset < self.base_offset {
+            return None;
+        }
+
+        let offset = offset - self.base_offset;
+        match self.file.get(offset as usize) {
             Some(record) => Some(record.clone()),
             None => None,
         }
     }
 
     /// Reads multiple data from an offset to the end of segment
-    pub fn readv(&self, offset: usize, out: &mut Vec<T>) {
-        out.extend_from_slice(&self.file[offset..])
+    pub fn readv(&self, offset: u64, out: &mut Vec<T>) {
+        if offset < self.base_offset {
+            return;
+        }
+
+        let offset = offset - self.base_offset;
+        out.extend_from_slice(&self.file[offset as usize..])
     }
 }
