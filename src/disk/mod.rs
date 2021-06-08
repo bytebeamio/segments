@@ -1,65 +1,82 @@
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use bytes::Bytes;
+use fnv::FnvHashMap;
 
 mod index;
-use index::Index;
 mod segment;
-use segment::Segment;
+mod chunk;
+use chunk::Chunk;
 
-/// The handler for a segment file which is on the disk, and it's corresponding index file.
-pub(super) struct DiskSegment {
-    /// The handle for index file.
-    index: Index,
-    /// The handle for segment file.
-    segment: Segment,
-    /// The index at which we add stuff to. It is 1 beyond the actual value stored.
-    tail: u64,
+// TODO: document everything in here
+
+pub(super) struct DiskHandler {
+    segments: FnvHashMap<u64, Chunk>,
+    dir: PathBuf,
 }
 
-impl DiskSegment {
-    #[inline]
-    pub(super) fn new<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
-        let commit_path = dir.as_ref().join(&format!("{:020}", index));
-        let index_path = commit_path.join(".index");
-        let segment_path = commit_path.join(".segment");
+impl DiskHandler {
+    pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
+        let _ = fs::create_dir_all(&dir)?;
 
-        // PROBLEM: We don't verify whether index file's offsets make sense, for example, the max
-        // length in index file might be larger than the file, or offsets are beyond the file etc.
-        // SAFETY: We are the ones to write to both segment as well as index files, and assume no
-        // external interference.
-        //
-        // TODO: maybe we should verify?
-        let (index, tail) = Index::new(index_path)?;
-        let segment = Segment::new(segment_path)?;
+        let files = fs::read_dir(&dir)?;
+        let mut base_offsets = Vec::new();
+        let mut segments = FnvHashMap::default();
+        for file in files {
+            let path = file?.path();
+            let offset = path.file_stem().unwrap().to_str().unwrap();
+            let offset = offset.parse::<u64>().unwrap();
+            segments.insert(offset, Chunk::new(&dir, offset)?);
+            base_offsets.push(offset);
+        }
+        base_offsets.sort_unstable();
 
-        Ok(Self {
-            index,
-            segment,
-            tail,
-        })
+        let head = if let Some(head) = base_offsets.last() {
+            head + 1
+        } else {
+            0
+        };
+
+        Ok((
+            head,
+            Self {
+                segments,
+                dir: dir.as_ref().into(),
+            },
+        ))
     }
 
     #[inline]
-    pub(super) fn read(&mut self, index: u64) -> io::Result<Bytes> {
-        let [offset, len] = self.index.read(index)?;
-        self.segment.read(offset, len)
+    pub(super) fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
+        if let Some(disk_segment) = self.segments.get_mut(&index) {
+            disk_segment.read(offset)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ))
+        }
     }
 
     #[inline]
-    pub(super) fn readv(&mut self, index: u64, len: u64) -> io::Result<Vec<Bytes>> {
-        let offsets = self.index.readv(index, len)?;
-        self.segment.readv(offsets)
+    pub(super) fn readv(&mut self, index: u64, offset: u64, len: u64) -> io::Result<Vec<Bytes>> {
+        if let Some(disk_segment) = self.segments.get_mut(&index) {
+            disk_segment.readv(offset, len)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ))
+        }
     }
 
     #[inline]
-    pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
-        self.tail += 1;
-        self.index.append(bytes.len() as u64)?;
-        self.segment.append(bytes)
+    pub(super) fn push(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<u64> {
+        let mut disk_segment = Chunk::new(&self.dir, index)?;
+        disk_segment.appendv(data)
     }
 }

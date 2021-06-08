@@ -6,9 +6,15 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 
+use super::index::Index;
+
+/// Wrapper around the segment file.
 pub(super) struct Segment {
+    /// A buffered reader for the segment file.
     reader: BufReader<File>,
+    /// A buffered writer for the segment file.
     writer: BufWriter<File>,
+    /// The total size of segment file in bytes.
     size: u64,
 }
 
@@ -35,6 +41,12 @@ impl Segment {
             writer,
             size,
         })
+    }
+
+    #[inline]
+    /// Returns the size of the file the segment is holding.
+    pub(super) fn size(&self) -> u64 {
+        self.size
     }
 
     /// Reads `len` bytes from given `offset` in the file.
