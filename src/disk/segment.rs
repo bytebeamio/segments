@@ -5,6 +5,7 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
+use log::debug;
 
 use super::index::Index;
 
@@ -52,13 +53,18 @@ impl Segment {
     /// Reads `len` bytes from given `offset` in the file.
     #[inline]
     pub(super) fn read(&mut self, offset: u64, len: u64) -> io::Result<Bytes> {
-        let len = len as usize;
-        if offset >= self.size {
+        if offset + len > self.size {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("given offset {} when file size is {}", offset, self.size).as_str(),
+                format!(
+                    "given offset + len = {} when file size is {}",
+                    offset + len,
+                    self.size
+                )
+                .as_str(),
             ));
         }
+        let len = len as usize;
         let mut bytes = BytesMut::with_capacity(len);
         // SAFETY: We fill it with the contents later on, and has already been allocated.
         unsafe { bytes.set_len(len) };
@@ -80,7 +86,7 @@ impl Segment {
             }
             total
         } else {
-            return Ok(vec![Bytes::new()])
+            return Ok(vec![Bytes::new()]);
         };
 
         let mut buf = self.read(offsets[0][0], total)?;
@@ -93,7 +99,8 @@ impl Segment {
         Ok(v)
     }
 
-    /// Append a packet to the segment.
+    /// Append a packet to the segment. Note that appending is buffered, thus always call
+    /// [`Segment::flush`] before reading.
     #[inline]
     pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
         let index = self.size;
@@ -101,5 +108,87 @@ impl Segment {
         self.writer.write_all(&bytes)?;
         self.size += bytes.len() as u64;
         Ok(index)
+    }
+
+    #[inline(always)]
+    pub(super) fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+
+    #[cfg(test)]
+    fn actual_size(self) -> io::Result<(Self, u64)> {
+        let Self {
+            reader,
+            writer,
+            size,
+        } = self;
+        let file = reader.into_inner();
+        let actual_len = file.metadata()?.len();
+        Ok((
+            Self {
+                reader: BufReader::new(file),
+                writer,
+                size,
+            },
+            actual_len,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use bytes::Bytes;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn append_and_read_segment() {
+        let dir = tempdir().unwrap();
+        let mut segment = Segment::new(dir.path().join(&format!("{:020}", 1))).unwrap();
+        assert_eq!(segment.size(), 0);
+
+        // appending 20 x 1KB to segment. results in:
+        // - size = 20KB = 20 * 1024
+        // - segment[0..1023] = 0, segment[1024..2047] = 1 and so on
+        for i in 0..20u8 {
+            segment.append(Bytes::from(vec![i; 1024])).unwrap();
+        }
+        assert_eq!(segment.size(), 20 * 1024);
+        segment.flush().unwrap();
+        let (mut segment, actual_len) = segment.actual_size().unwrap();
+        assert_eq!(actual_len, 20 * 1024);
+        for i in 0..20u8 {
+            let byte = segment.read(i as u64 * 1024, 1024).unwrap();
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i);
+            assert_eq!(byte[1023], i);
+        }
+    }
+
+    #[test]
+    fn append_and_read_segment_after_saving_on_disk() {
+        let dir = tempdir().unwrap();
+        let mut segment = Segment::new(dir.path().join(&format!("{:020}", 1))).unwrap();
+        assert_eq!(segment.size(), 0);
+
+        // appending 20 x 1KB to segment. results in:
+        // - size = 20KB = 20 * 1024
+        // - segment[0..1023] = 0, segment[1024..2047] = 1 and so on
+        for i in 0..20u8 {
+            segment.append(Bytes::from(vec![i; 1024])).unwrap();
+        }
+        drop(segment);
+        let segment = Segment::new(dir.path().join(&format!("{:020}", 1))).unwrap();
+        assert_eq!(segment.size(), 20 * 1024);
+        let (mut segment, actual_len) = segment.actual_size().unwrap();
+        assert_eq!(actual_len, 20 * 1024);
+        for i in 0..20u8 {
+            let byte = segment.read(i as u64 * 1024, 1024).unwrap();
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i);
+            assert_eq!(byte[1023], i);
+        }
     }
 }
