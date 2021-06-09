@@ -17,4 +17,6 @@ log = "0.4.14"
 
 [dev-dependencies]
 mqttbytes = "0.3.0"
+pretty_assertions = "0.7.2"
 simplelog = "0.10.0"
+tempfile = "3.2.0"

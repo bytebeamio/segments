@@ -77,7 +77,7 @@ impl Segment {
 
     /// Get packets from given vector of indices and corresponding lens.
     #[inline]
-    pub(super) fn readv(&mut self, offsets: Vec<[u64; 2]>) -> io::Result<Vec<Bytes>> {
+    pub(super) fn readv(&mut self, offsets: Vec<[u64; 2]>, out: &mut Vec<Bytes>) -> io::Result<()> {
         let len = offsets.len();
         let total = if let Some(first) = offsets.first() {
             let mut total = first[1];
@@ -86,30 +86,30 @@ impl Segment {
             }
             total
         } else {
-            return Ok(vec![Bytes::new()]);
+            return Ok(());
         };
 
         let mut buf = self.read(offsets[0][0], total)?;
-        let mut v = Vec::with_capacity(len);
 
         for offset in offsets.into_iter() {
-            v.push(buf.split_to(offset[1] as usize));
+            out.push(buf.split_to(offset[1] as usize));
         }
 
-        Ok(v)
+        Ok(())
     }
 
     /// Append a packet to the segment. Note that appending is buffered, thus always call
-    /// [`Segment::flush`] before reading.
+    /// [`Segment::flush`] before reading. Returns offset at which bytes were appended.
     #[inline]
     pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
-        let index = self.size;
+        let offset = self.size;
         self.writer.seek(SeekFrom::End(0))?;
         self.writer.write_all(&bytes)?;
         self.size += bytes.len() as u64;
-        Ok(index)
+        Ok(offset)
     }
 
+    /// Flush the contents to disk.
     #[inline(always)]
     pub(super) fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
@@ -157,6 +157,7 @@ mod test {
         }
         assert_eq!(segment.size(), 20 * 1024);
         segment.flush().unwrap();
+
         let (mut segment, actual_len) = segment.actual_size().unwrap();
         assert_eq!(actual_len, 20 * 1024);
         for i in 0..20u8 {
@@ -164,6 +165,18 @@ mod test {
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
+        }
+
+        let mut offsets = Vec::with_capacity(20);
+        for i in 0..20 {
+            offsets.push([i * 1024, 1024]);
+        }
+        let mut out = Vec::with_capacity(20);
+        segment.readv(offsets, &mut out).unwrap();
+        for (i, byte) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
         }
     }
 
@@ -179,16 +192,31 @@ mod test {
         for i in 0..20u8 {
             segment.append(Bytes::from(vec![i; 1024])).unwrap();
         }
+
         drop(segment);
+
         let segment = Segment::new(dir.path().join(&format!("{:020}", 1))).unwrap();
         assert_eq!(segment.size(), 20 * 1024);
         let (mut segment, actual_len) = segment.actual_size().unwrap();
+
         assert_eq!(actual_len, 20 * 1024);
         for i in 0..20u8 {
             let byte = segment.read(i as u64 * 1024, 1024).unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
+        }
+
+        let mut offsets = Vec::with_capacity(20);
+        for i in 0..20 {
+            offsets.push([i * 1024, 1024]);
+        }
+        let mut out = Vec::with_capacity(20);
+        segment.readv(offsets, &mut out).unwrap();
+        for (i, byte) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
         }
     }
 }

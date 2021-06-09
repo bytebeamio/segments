@@ -28,7 +28,7 @@ pub(super) struct Index {
     /// Index at which next call to [`Index::append`] will append to.
     tail: u64,
     /// The last entry that was appended.
-    last_entry: (u64, u64)
+    last_entry: (u64, u64),
 }
 
 impl Index {
@@ -38,12 +38,16 @@ impl Index {
         // TODO: maybe memory map files?
 
         let file = OpenOptions::new()
+            .create(true)
             .append(true)
             .read(true)
-            .create(true)
             .open(path)?;
         let tail = file.metadata()?.len() / ENTRY_SIZE;
-        let mut index = Self { file, tail, last_entry: (0, 0) };
+        let mut index = Self {
+            file,
+            tail,
+            last_entry: (0, 0),
+        };
 
         if tail == 0 {
             Ok(index)
@@ -52,13 +56,12 @@ impl Index {
             index.last_entry = (offset, len);
             Ok(index)
         }
-
     }
 
     /// Return the index at which next call to [`Index::append`] will append to.
     #[inline(always)]
 
-    pub(super) fn append_index(&self) -> u64 {
+    pub(super) fn entries(&self) -> u64 {
         self.tail
     }
 
@@ -74,25 +77,24 @@ impl Index {
         Ok(unsafe { std::mem::transmute(self.file.read_u128::<BigEndian>()?) })
     }
 
-    /// Get the sizes of packets, starting from the given index upto the given lenght
+    /// Get the sizes of packets, starting from the given index upto the given length. If `len` is
+    /// larger than number of packets stored in segment, it will return as the 2nd element of the
+    /// return tuple the number of packets still left to read.
     #[inline]
-    pub(super) fn readv(&mut self, index: u64, len: u64) -> io::Result<Vec<[u64; 2]>> {
+    pub(super) fn readv(&mut self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
+        let left = if len > self.tail { len - self.tail } else { 0 };
         let len = len as usize;
         let mut buf = Vec::with_capacity(len);
         self.file.seek(SeekFrom::Start(index * ENTRY_SIZE))?;
 
-        // SAFETY: We have already preallocated the capacity, and
-        //         ENTRY_SIZE = 16 = size of [u64; 2] in bytes
+        // SAFETY: We have already preallocated the capacity.
         unsafe {
-            self.file
-                .read_exact(std::mem::transmute(std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr(),
-                    len * ENTRY_SIZE as usize,
-                )))?;
             buf.set_len(len);
+            self.file
+                .read_u128_into::<BigEndian>(std::mem::transmute(&mut buf[..]))?;
         }
 
-        Ok(buf)
+        Ok((buf, left))
     }
 
     /// Append a new value to the index file.
@@ -116,10 +118,10 @@ mod test {
     use super::*;
 
     #[test]
-    fn append_and_read() {
+    fn append_and_read_index() {
         let dir = tempdir().unwrap();
         let mut index = Index::new(dir.path().join(&format!("{:020}", 1))).unwrap();
-        assert_eq!(index.append_index(), 0);
+        assert_eq!(index.entries(), 0);
 
         // Adding 10 len entries of 100 size each. results in:
         //  - tail = 10
@@ -128,7 +130,7 @@ mod test {
         for _ in 0..10 {
             index.append(100).unwrap();
         }
-        assert_eq!(index.append_index(), 10);
+        assert_eq!(index.entries(), 10);
         assert_eq!(index.read(9).unwrap(), [900, 100]);
 
         // Adding 10 len entries of 200 size each. results in:
@@ -138,15 +140,25 @@ mod test {
         for _ in 0..10 {
             index.append(200).unwrap();
         }
-        assert_eq!(index.append_index(), 20);
+        assert_eq!(index.entries(), 20);
         assert_eq!(index.read(19).unwrap(), [2800, 200]);
+
+        let (v, _) = index.readv(0, 20).unwrap();
+        for i in 0..10 {
+            assert_eq!(v[i][0] as usize, 100 * i);
+            assert_eq!(v[i][1], 100);
+        }
+        for i in 10..20 {
+            assert_eq!(v[i][0] as usize, 1000 + 200 * (i - 10));
+            assert_eq!(v[i][1], 200);
+        }
     }
 
     #[test]
-    fn append_and_read_after_saving_on_disk() {
+    fn append_and_read_index_after_saving_on_disk() {
         let dir = tempdir().unwrap();
         let mut index = Index::new(dir.path().join(&format!("{:020}", 1))).unwrap();
-        assert_eq!(index.append_index(), 0);
+        assert_eq!(index.entries(), 0);
 
         // Adding 10 len entries of 100 size each. results in:
         //  - tail = 10
@@ -155,7 +167,7 @@ mod test {
         for _ in 0..10 {
             index.append(100).unwrap();
         }
-        assert_eq!(index.append_index(), 10);
+        assert_eq!(index.entries(), 10);
 
         // Adding 10 len entries of 200 size each. results in:
         //  - tail = 20
@@ -164,12 +176,22 @@ mod test {
         for _ in 0..10 {
             index.append(200).unwrap();
         }
-        assert_eq!(index.append_index(), 20);
+        assert_eq!(index.entries(), 20);
 
         drop(index);
         let mut index = Index::new(dir.path().join(&format!("{:020}", 1))).unwrap();
 
         assert_eq!(index.read(9).unwrap(), [900, 100]);
         assert_eq!(index.read(19).unwrap(), [2800, 200]);
+
+        let (v, _) = index.readv(0, 20).unwrap();
+        for i in 0..10 {
+            assert_eq!(v[i][0] as usize, 100 * i);
+            assert_eq!(v[i][1], 100);
+        }
+        for i in 10..20 {
+            assert_eq!(v[i][0] as usize, 1000 + 200 * (i - 10));
+            assert_eq!(v[i][1], 200);
+        }
     }
 }
