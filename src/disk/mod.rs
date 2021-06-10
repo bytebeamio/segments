@@ -8,9 +8,12 @@ use fnv::FnvHashMap;
 
 mod chunk;
 mod index;
+mod invalid;
 mod segment;
 
 use chunk::Chunk;
+use invalid::InvalidFile;
+pub use invalid::InvalidType;
 
 /// A wrapper around all index and segment files on the disk.
 pub(super) struct DiskHandler {
@@ -18,8 +21,11 @@ pub(super) struct DiskHandler {
     chunks: FnvHashMap<u64, Chunk>,
     /// The directory in which to store files in.
     dir: PathBuf,
-    /// The indices of the open files.
-    indices: Vec<u64>,
+    /// The starting index of segment files.
+    head: u64,
+    /// The ending index of segment files.
+    tail: u64,
+    invalid_files: Vec<InvalidFile>,
 }
 
 //TODO: Review all unwraps
@@ -27,35 +33,131 @@ impl DiskHandler {
     /// Create a new disk handler which saves files in the given directory.
     /// REVIEW: Documentation specifying return of inmemory head
     pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
-        let _ = fs::create_dir_all(&dir)?;
+        struct FileStatus {
+            pub(super) index_found: bool,
+            segment_found: bool,
+            checksum_matched: bool,
+        }
 
+        // creating and reading given dir
+        let _ = fs::create_dir_all(&dir)?;
         let files = fs::read_dir(&dir)?;
+
         let mut indices = Vec::new();
-        let mut segments = FnvHashMap::default();
-        // REVIEW: Index file and segment file will have same names after removing
-        // extensions. This leads to duplicate segments in the second run
+        let mut statuses: FnvHashMap<u64, FileStatus> = FnvHashMap::default();
+        let mut invalid_files = Vec::new();
+
+        // checking status of files in dir, storing valid index in `indices`
         for file in files {
             let path = file?.path();
-            // REVIEW: Rename this to file index
-            let offset = path.file_stem().unwrap().to_str().unwrap();
-            let offset = offset.parse::<u64>().unwrap();
-            segments.insert(offset, Chunk::new(&dir, offset)?);
+
+            let file_index = match path.file_stem() {
+                // TODO: is this unwrap fine?
+                Some(s) => s.to_str().unwrap(),
+                None => {
+                    invalid_files.push(InvalidFile {
+                        path,
+                        error_type: InvalidType::InvalidName,
+                    });
+                    continue;
+                }
+            };
+
+            let offset = match file_index.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    invalid_files.push(InvalidFile {
+                        path,
+                        error_type: InvalidType::InvalidName,
+                    });
+                    continue;
+                }
+            };
+
+            // TODO: is this unwrap fine?
+            match path.extension().map(|s| s.to_str().unwrap()) {
+                Some("index") => {
+                    if let Some(status) = statuses.get_mut(&offset) {
+                        // TODO: also verify checksum here
+                        status.index_found = true;
+                    } else {
+                        statuses.insert(
+                            offset,
+                            FileStatus {
+                                index_found: true,
+                                segment_found: false,
+                                checksum_matched: false,
+                            },
+                        );
+                    }
+                }
+                Some("segment") => {
+                    if let Some(status) = statuses.get_mut(&offset) {
+                        // TODO: also verify checksum here
+                        status.segment_found = true;
+                    } else {
+                        statuses.insert(
+                            offset,
+                            FileStatus {
+                                index_found: false,
+                                segment_found: true,
+                                checksum_matched: false,
+                            },
+                        );
+                    }
+                }
+                _ => invalid_files.push(InvalidFile {
+                    path,
+                    error_type: InvalidType::InvalidName,
+                }),
+            }
+
             indices.push(offset);
         }
-        indices.sort_unstable();
 
-        let head = if let Some(head) = indices.last() {
-            head + 1
+        // getting the head and tail
+        indices.sort_unstable();
+        let (inmemory_head, head, tail) = if let Some(tail) = indices.last() {
+            // unwrap fine as if last exists then first exists as well, even if they are the same
+            (*tail + 1, *indices.first().unwrap(), *tail)
         } else {
-            0
+            (0, 0, 0)
         };
 
+        // opening valid files, sorting the invalid ones
+        let mut chunks = FnvHashMap::default();
+        for (
+            index,
+            FileStatus {
+                index_found,
+                segment_found,
+                checksum_matched,
+            },
+        ) in statuses.into_iter()
+        {
+            if !index_found {
+                invalid_files.push(InvalidFile {
+                    path: dir.as_ref().into().join(format!("{:020}", index).as_str()),
+                    error_type: InvalidType::NoIndex(index),
+                });
+            } else if !segment_found {
+                invalid_files.push(InvalidFile {
+                    path: dir.as_ref().into().join(format!("{:020}", index).as_str()),
+                    error_type: InvalidType::NoSegment(index),
+                });
+            } else {
+                chunks.insert(index, Chunk::new(dir, index)?);
+            }
+        }
+
         Ok((
-            head,
+            inmemory_head,
             Self {
-                chunks: segments,
+                chunks,
                 dir: dir.as_ref().into(),
-                indices,
+                head,
+                tail: inmemory_head,
+                invalid_files
             },
         ))
     }
