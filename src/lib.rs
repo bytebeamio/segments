@@ -26,24 +26,24 @@ use segment::Segment;
 ///   max_segment_size by more than the overflowing bytes of the last packet.
 pub struct CommitLog {
     /// The index at which segments of memory start.
-    pub(crate) head: u64,
+    pub head: u64,
     /// The index at which the current active segment is, and also marks the last valid segment as
     /// well as last segment in memory.
-    pub(crate) tail: u64,
+    pub tail: u64,
     /// Maximum size of any segment in memory.
-    pub(crate) max_segment_size: u64,
+    pub max_segment_size: u64,
     /// Maximum number of segments in memory, apart from the active segment.
-    pub(crate) max_segments: u64,
+    pub max_segments: u64,
     /// The active segment, to which incoming [`Bytes`] are appended to. Note that the bytes are
     /// themselves not mutable.
-    pub(crate) active_segment: Segment,
+    pub active_segment: Segment,
     /// Total size of active segment, used for enforcing the contraints.
-    pub(crate) segments: FnvHashMap<u64, Segment>,
+    pub segments: FnvHashMap<u64, Segment>,
     /// Total size of segments in memory apart from active_segment, used for enforcing the
     /// contraints.
-    pub(crate) segments_size: u64,
+    pub segments_size: u64,
     /// A set of opened file handles to all the segments stored onto the disk. This is optional.
-    pub(crate) disk_handler: Option<DiskHandler>,
+    pub disk_handler: Option<DiskHandler>,
     // TODO: add max_index_file_size?
 }
 
@@ -92,7 +92,7 @@ impl CommitLog {
         Ok((self.tail, self.active_segment.len() as u64))
     }
 
-    fn apply_retention(&mut self) -> io::Result<()> {
+    pub fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
             if self.segments.len() as u64 >= self.max_segments {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
@@ -178,6 +178,7 @@ impl CommitLog {
         let mut out = Vec::with_capacity(len as usize);
         loop {
             if index < self.head {
+                debug!("disk called");
                 if let Some(handler) = self.disk_handler.as_mut() {
                     let (new_len, next_index) = handler.readv(index, offset, len, &mut out)?;
                     len = new_len;
@@ -186,6 +187,7 @@ impl CommitLog {
                     let index = next_index.unwrap_or(self.head);
                     // start from beginning of next segment
                     offset = 0;
+                    debug!("disk fine");
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -193,6 +195,7 @@ impl CommitLog {
                     ));
                 }
             } else if index < self.tail {
+                debug!("segment called");
                 let segment = self.segments.get(&index).unwrap();
                 if offset >= segment.len() as u64 {
                     return Err(io::Error::new(
@@ -209,7 +212,9 @@ impl CommitLog {
                 index += 1;
                 // start from beginning of next segment
                 offset = 0;
+                debug!("segment fine");
             } else if index == self.tail {
+                debug!("active_segment called");
                 if offset > self.active_segment.len() as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -221,6 +226,7 @@ impl CommitLog {
                     ));
                 }
                 len = self.active_segment.readv(offset, len, &mut out);
+                debug!("active_segment fine");
                 // we have read from active segment as well. even if len not satisfied, we can not
                 // read further so break anyway.
                 break;
@@ -413,15 +419,23 @@ mod test {
 
     #[test]
     fn read_from_everywhere() {
+        init_logging();
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let dir = tempdir().unwrap();
         let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
 
+        // 160 packets in active_segment, 800 packets in segment, 640 packets in disk
         for i in 0..100 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
         }
+
+        log.disk_handler.as_mut().unwrap().flush().unwrap();
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 10);
+        assert_eq!(log.segments.len(), 5);
+        assert_eq!(log.disk_handler.as_ref().unwrap().len(), 4);
 
         let mut offset = 0;
         let mut index = 0;

@@ -8,25 +8,25 @@ use bytes::Bytes;
 use fnv::FnvHashMap;
 use log::debug;
 
-mod chunk;
-mod index;
-mod segment;
+pub mod chunk;
+pub mod index;
+pub mod segment;
 
 use chunk::Chunk;
 
 /// A wrapper around all index and segment files on the disk.
-pub(super) struct DiskHandler {
+pub struct DiskHandler {
     /// Hashmap for file handlers of index and segment files.
-    chunks: FnvHashMap<u64, Chunk>,
+    pub chunks: FnvHashMap<u64, Chunk>,
     /// The directory in which to store files in.
-    dir: PathBuf,
+    pub dir: PathBuf,
     /// The indices of the open files.
-    indices: Vec<u64>,
+    pub indices: Vec<u64>,
 }
 
 impl DiskHandler {
     /// Create a new disk handler which saves files in the given directory.
-    pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
+    pub fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
         let _ = fs::create_dir_all(&dir)?;
 
         let files = fs::read_dir(&dir)?;
@@ -59,13 +59,13 @@ impl DiskHandler {
 
     /// Return the total number of segments.
     #[inline]
-    pub(super) fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.chunks.len() as u64
     }
 
     /// Read a single packet from given offset in segment at given index.
     #[inline]
-    pub(super) fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
+    pub fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
         if let Some(chunk) = self.chunks.get_mut(&index) {
             chunk.read(offset)
         } else {
@@ -81,7 +81,7 @@ impl DiskHandler {
     /// packets. Returns the number of packets left to read, but were not found, and the index of
     /// next segment if exists.
     #[inline]
-    pub(super) fn readv(
+    pub fn readv(
         &mut self,
         index: u64,
         offset: u64,
@@ -136,7 +136,7 @@ impl DiskHandler {
     /// Store a vector of bytes to the disk. Returns offset at which bytes were appended to the
     /// segment at the given index.
     #[inline]
-    pub(super) fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<u64> {
+    pub fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<u64> {
         let mut chunk = Chunk::new(&self.dir, index)?;
         let res = chunk.appendv(data)?;
         self.chunks.insert(index, chunk);
@@ -145,7 +145,7 @@ impl DiskHandler {
     }
 
     /// Flush all the segments files.
-    pub(super) fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         for chunk in self.chunks.values_mut() {
             chunk.flush()?;
         }
@@ -154,7 +154,7 @@ impl DiskHandler {
 
     /// Flush the segment file at the given index.
     #[inline]
-    pub(super) fn flush_at(&mut self, index: u64) -> io::Result<()> {
+    pub fn flush_at(&mut self, index: u64) -> io::Result<()> {
         self.chunks
             .get_mut(&index)
             .ok_or(io::Error::new(
@@ -165,7 +165,7 @@ impl DiskHandler {
     }
 
     #[cfg(test)]
-    fn real_segment_size(&mut self, index: u64) -> io::Result<u64> {
+    pub fn real_segment_size(&mut self, index: u64) -> io::Result<u64> {
         let temp = self.chunks.remove(&index).unwrap();
         let (temp, ret) = temp.real_segment_size()?;
         self.chunks.insert(index, temp);
@@ -257,7 +257,6 @@ mod test {
 
     #[test]
     fn read_handler_from_returned_index() {
-        init_logging();
         let dir = tempdir().unwrap();
         let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
         let (ranpack_bytes, _) = random_packets_as_bytes();
