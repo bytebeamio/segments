@@ -94,8 +94,9 @@ impl CommitLog {
 
     fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
-            if self.segments_size >= self.max_segment_size {
+            if self.segments.len() as u64 >= self.max_segments {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
+                self.segments_size -= removed_segment.size();
 
                 if let Some(files) = self.disk_handler.as_mut() {
                     files.insert(self.head, removed_segment.into_data())?;
@@ -330,7 +331,7 @@ mod test {
     }
 
     #[test]
-    fn active_segment_store() {
+    fn active_segment() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
 
@@ -354,7 +355,7 @@ mod test {
     }
 
     #[test]
-    fn memory_segment_store() {
+    fn memory_segment() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
 
@@ -367,28 +368,7 @@ mod test {
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
         assert_eq!(log.active_segment.size() as usize, len * 7);
 
-        for i in 0..7 {
-            for byte in ranpack_bytes.clone() {
-                log.append(byte).unwrap();
-            }
-        }
-
-        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 4);
-        assert_eq!(log.active_segment.size() as usize, len * 4);
-        assert_eq!(log.segments.get_mut(&0).unwrap().size() as usize, len * 10);
-        assert_eq!(
-            log.segments.get_mut(&0).unwrap().len() as usize,
-            ranpack_bytes.len() * 10
-        );
-    }
-
-    #[test]
-    fn disk_segment_store() {
-        let (ranpack_bytes, len) = random_packets_as_bytes();
-        let dir = tempdir().unwrap();
-        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
-
-        for i in 0..7 {
+        for i in 0..70 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -396,25 +376,61 @@ mod test {
 
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
         assert_eq!(log.active_segment.size() as usize, len * 7);
+        assert_eq!(log.segments.get_mut(&0).unwrap().size() as usize, len * 10);
+        assert_eq!(
+            log.segments.get_mut(&0).unwrap().len() as usize,
+            ranpack_bytes.len() * 10
+        );
+        assert_eq!(log.segments.len(), 7);
+    }
 
-        for i in 0..75 {
+    #[test]
+    fn disk_segment() {
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let dir = tempdir().unwrap();
+        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+
+        for i in 0..5 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
         }
 
-        assert_eq!(log.active_segment.len() as usize, 5);
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 5);
+        assert_eq!(log.active_segment.size() as usize, len * 5);
+
+        for i in 0..70 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.size() as usize, 5 * len);
+        assert_eq!(log.active_segment.len() as usize, 5 * ranpack_bytes.len());
         assert_eq!(log.segments_size, len as u64 * 10 * 5);
         assert_eq!(log.disk_handler.unwrap().len(), 2);
     }
 
-    fn active_segment_read() {
-        todo!()
-    }
-    fn memory_segment_read() {
-        todo!()
-    }
-    fn disk_segment_read() {
-        todo!()
+    #[test]
+    fn read_from_everywhere() {
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let dir = tempdir().unwrap();
+        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+
+        for i in 0..100 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        let mut offset = 0;
+        let mut index = 0;
+        for i in 0..100 {
+            debug!("{}", i);
+            let v = log.readv(index, offset, 16).unwrap();
+            index = v.1;
+            offset = v.2;
+            verify_bytes_as_random_packets(v.0, 16);
+        }
     }
 }

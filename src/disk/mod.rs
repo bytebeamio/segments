@@ -288,11 +288,9 @@ mod test {
         while let Some(seg) = ret {
             v.clear();
             offset = if left > 0 { 0 } else { offset + 10 };
-            debug!("seg {} offset {}", seg, offset);
             let (new_left, new_ret) = handler.readv(seg, offset, 10, &mut v).unwrap();
             left = new_left;
             ret = new_ret;
-            debug!("seg {}", seg);
         }
 
         assert_eq!(left, 0);
