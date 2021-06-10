@@ -49,6 +49,8 @@ impl CommitLog {
     /// does not exist, and the segment at `self.head` will be stored onto disk instead of simply
     /// being deleted.
     pub fn new(max_segment_size: u64, max_segments: u64, dir: Option<PathBuf>) -> io::Result<Self> {
+        // REVIEW: Usually early returns are much more readable for exceptions
+        // than long if else chains
         if max_segment_size < 1024 {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -128,7 +130,10 @@ impl CommitLog {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
                 self.segments_size -= removed_segment.size();
 
+                // REVIEW: Inmemory and disk segment sizes are same in our design.
+                // There'll never be a partially filled file. Flush everytime
                 if let Some(files) = self.disk_handler.as_mut() {
+                    // REVIEW: Add checksum
                     files.insert(self.head, removed_segment.into_data())?;
                 }
 
@@ -215,11 +220,15 @@ impl CommitLog {
         mut offset: u64,
         mut len: u64,
     ) -> io::Result<(Vec<Bytes>, u64, u64, u64)> {
+        // REVIEW: let mut remaining_len = len;
         let mut out = Vec::with_capacity(len as usize);
         loop {
             if index < self.head {
                 debug!("disk called");
                 if let Some(handler) = self.disk_handler.as_mut() {
+                    // REVIEW: Instead of looping to jump from disk to memory,
+                    // check 'out' len and if it has less than what is asked for
+                    // , do inmemory handling. Otherwise early return
                     let (new_len, next_index) = handler.readv(index, offset, len, &mut out)?;
                     len = new_len;
                     // start reading from memory in next iteration if no segment left to read on

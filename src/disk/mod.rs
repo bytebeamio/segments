@@ -22,16 +22,21 @@ pub(super) struct DiskHandler {
     indices: Vec<u64>,
 }
 
+//TODO: Review all unwraps
 impl DiskHandler {
     /// Create a new disk handler which saves files in the given directory.
+    /// REVIEW: Documentation specifying return of inmemory head
     pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
         let _ = fs::create_dir_all(&dir)?;
 
         let files = fs::read_dir(&dir)?;
         let mut indices = Vec::new();
         let mut segments = FnvHashMap::default();
+        // REVIEW: Index file and segment file will have same names after removing
+        // extensions. This leads to duplicate segments in the second run
         for file in files {
             let path = file?.path();
+            // REVIEW: Rename this to file index
             let offset = path.file_stem().unwrap().to_str().unwrap();
             let offset = offset.parse::<u64>().unwrap();
             segments.insert(offset, Chunk::new(&dir, offset)?);
@@ -105,6 +110,7 @@ impl DiskHandler {
         };
         len = chunk.readv(offset, len, out)?;
 
+        // REVIEW: Use segments hashmap instead of binary_search
         // as we find segment at `index` in self.chunks, it must exist in self.indices
         let mut segment_idx = self.indices.binary_search(&index).unwrap();
 
