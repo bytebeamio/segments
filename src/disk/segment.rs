@@ -11,13 +11,13 @@ use super::index::Index;
 
 /// Wrapper around the segment file.
 #[derive(Debug)]
-pub struct Segment {
+pub(super) struct Segment {
     /// A buffered reader for the segment file.
-    pub reader: BufReader<File>,
+    reader: BufReader<File>,
     /// A buffered writer for the segment file.
-    pub writer: BufWriter<File>,
+    writer: BufWriter<File>,
     /// The total size of segment file in bytes.
-    pub size: u64,
+    size: u64,
 }
 
 /// A wrapper around a single segment file for convenient reading of bytes. Does **not** enforce
@@ -29,7 +29,7 @@ pub struct Segment {
 impl Segment {
     /// Open/create a new segment file.
     #[inline]
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub(super) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new()
             .append(true)
             .read(true)
@@ -47,13 +47,13 @@ impl Segment {
 
     #[inline]
     /// Returns the size of the file the segment is holding.
-    pub fn size(&self) -> u64 {
+    pub(super) fn size(&self) -> u64 {
         self.size
     }
 
     /// Reads `len` bytes from given `offset` in the file.
     #[inline]
-    pub fn read(&mut self, offset: u64, len: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&mut self, offset: u64, len: u64) -> io::Result<Bytes> {
         if offset + len > self.size {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -78,7 +78,7 @@ impl Segment {
 
     /// Get packets from given vector of indices and corresponding lens.
     #[inline]
-    pub fn readv(&mut self, offsets: Vec<[u64; 2]>, out: &mut Vec<Bytes>) -> io::Result<()> {
+    pub(super) fn readv(&mut self, offsets: Vec<[u64; 2]>, out: &mut Vec<Bytes>) -> io::Result<()> {
         let len = offsets.len();
         let total = if let Some(first) = offsets.first() {
             let mut total = first[1];
@@ -102,7 +102,7 @@ impl Segment {
     /// Append a packet to the segment. Note that appending is buffered, thus always call
     /// [`Segment::flush`] before reading. Returns offset at which bytes were appended.
     #[inline]
-    pub fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
+    pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
         let offset = self.size;
         self.writer.seek(SeekFrom::End(0))?;
         self.writer.write_all(&bytes)?;
@@ -112,12 +112,12 @@ impl Segment {
 
     /// Flush the contents to disk.
     #[inline(always)]
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub(super) fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()
     }
 
     #[cfg(test)]
-    pub(crate) fn actual_size(self) -> io::Result<(Self, u64)> {
+    fn actual_size(self) -> io::Result<(Self, u64)> {
         let Self {
             reader,
             writer,

@@ -8,11 +8,11 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use log::{debug, info, warn};
 
 /// Size of the offset of packet, in bytes.
-pub const OFFSET_SIZE: u64 = 8;
+const OFFSET_SIZE: u64 = 8;
 /// Size of the len of packet, in bytes.
-pub const LEN_SIZE: u64 = 8;
+const LEN_SIZE: u64 = 8;
 /// Size of entry, in bytes.
-pub const ENTRY_SIZE: u64 = OFFSET_SIZE + LEN_SIZE;
+const ENTRY_SIZE: u64 = OFFSET_SIZE + LEN_SIZE;
 
 /// Wrapper around a index file for convenient reading of bytes sizes.
 ///
@@ -23,19 +23,19 @@ pub const ENTRY_SIZE: u64 = OFFSET_SIZE + LEN_SIZE;
 /// It is the duty of the handler of this struct to ensure index file's size does not exceed the
 /// specified limit.
 #[derive(Debug)]
-pub struct Index {
+pub(super) struct Index {
     /// The opened index file.
-    pub file: File,
+    file: File,
     /// Index at which next call to [`Index::append`] will append to.
-    pub tail: u64,
+    tail: u64,
     /// The last entry that was appended.
-    pub last_entry: (u64, u64),
+    last_entry: (u64, u64),
 }
 
 impl Index {
     /// Open/create a new index file.
     #[inline]
-    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub(super) fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         // TODO: maybe memory map files?
 
         let file = OpenOptions::new()
@@ -62,13 +62,13 @@ impl Index {
     /// Return the index at which next call to [`Index::append`] will append to.
     #[inline(always)]
 
-    pub fn entries(&self) -> u64 {
+    pub(super) fn entries(&self) -> u64 {
         self.tail
     }
 
     /// Get the size of packet at the given index, using the index file.
     #[inline]
-    pub fn read(&mut self, index: u64) -> io::Result<[u64; 2]> {
+    pub(super) fn read(&mut self, index: u64) -> io::Result<[u64; 2]> {
         self.file.seek(SeekFrom::Start(index * ENTRY_SIZE))?;
         // SAFETY: if it is safe to read 2 u64s one after the another, then it is also safe to read
         // a single u128 in one go and parse it as [u64; 2]. Not using tuples as they don't have
@@ -82,7 +82,7 @@ impl Index {
     /// larger than number of packets stored in segment, it will return as the 2nd element of the
     /// return tuple the number of packets still left to read.
     #[inline]
-    pub fn readv(&mut self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
+    pub(super) fn readv(&mut self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
         let left = if len > self.tail { len - self.tail } else { 0 };
         let len = len as usize;
         let mut buf = Vec::with_capacity(len);
@@ -100,7 +100,7 @@ impl Index {
 
     /// Append a new value to the index file.
     #[inline]
-    pub fn append(&mut self, value: u64) -> io::Result<()> {
+    pub(super) fn append(&mut self, value: u64) -> io::Result<()> {
         let offset = self.last_entry.0 + self.last_entry.1;
         self.file.seek(SeekFrom::End(0))?;
         self.tail += 1;

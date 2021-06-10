@@ -10,17 +10,17 @@ use super::{index::Index, segment::Segment};
 
 /// The handler for a segment file which is on the disk, and it's corresponding index file.
 #[derive(Debug)]
-pub struct Chunk {
+pub(super) struct Chunk {
     /// The handle for index file.
-    pub index: Index,
+    index: Index,
     /// The handle for segment file.
-    pub segment: Segment,
+    segment: Segment,
 }
 
 impl Chunk {
     /// Create a new segment on the disk.
     #[inline]
-    pub fn new<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
+    pub(super) fn new<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
         let index_path = dir.as_ref().join(&format!("{:020}.index", index));
         let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
 
@@ -41,7 +41,7 @@ impl Chunk {
 
     /// Read a packet from the disk segment at the particular index.
     #[inline]
-    pub fn read(&mut self, index: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&mut self, index: u64) -> io::Result<Bytes> {
         let [offset, len] = self.index.read(index)?;
         self.segment.read(offset, len)
     }
@@ -49,7 +49,7 @@ impl Chunk {
     /// Read `len` packets from disk starting at `index`. If it is not possible to read `len`, it
     /// returns the number of bytes still left to read.
     #[inline]
-    pub fn readv(&mut self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn readv(&mut self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
         let (offsets, left) = self.index.readv(index, len)?;
         self.segment.readv(offsets, out)?;
         Ok(left)
@@ -57,13 +57,13 @@ impl Chunk {
 
     /// Appned a packet to the disk segment. Does not check for any size limit.
     #[inline]
-    pub fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
+    pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
         self.index.append(bytes.len() as u64)?;
         self.segment.append(bytes)
     }
 
     /// And multiple packets at once. Returns offset at which bytes were appended.
-    pub fn appendv(&mut self, bytes: Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn appendv(&mut self, bytes: Vec<Bytes>) -> io::Result<u64> {
         let mut total = 0;
         for byte in bytes.iter() {
             self.index.append(byte.len() as u64)?;
@@ -77,21 +77,14 @@ impl Chunk {
 
     /// Total number of packet appended.
     #[inline(always)]
-    pub fn entries(&self) -> u64 {
+    pub(super) fn entries(&self) -> u64 {
         self.index.entries()
     }
 
     /// Flush the contents to disk.
     #[inline(always)]
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub(super) fn flush(&mut self) -> io::Result<()> {
         self.segment.flush()
-    }
-
-    #[cfg(test)]
-    pub fn real_segment_size(self) -> io::Result<(Self, u64)> {
-        let Self { segment, index } = self;
-        let (segment, ret) = segment.actual_size()?;
-        Ok((Self { index, segment }, ret))
     }
 }
 
@@ -103,7 +96,7 @@ mod test {
     use super::*;
 
     #[test]
-    pub fn append_and_read_chunk() {
+    fn append_and_read_chunk() {
         let dir = tempdir().unwrap();
         let mut chunk = Chunk::new(dir.path(), 2).unwrap();
 
@@ -128,7 +121,7 @@ mod test {
     }
 
     #[test]
-    pub fn append_and_read_chunk_after_saving_to_disk() {
+    fn append_and_read_chunk_after_saving_to_disk() {
         let dir = tempdir().unwrap();
         let mut chunk = Chunk::new(dir.path(), 2).unwrap();
 

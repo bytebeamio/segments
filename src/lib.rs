@@ -17,7 +17,9 @@ use log::debug;
 use segment::Segment;
 
 /// The log which can store commits in memory, and push them onto disk when needed, as well as read
-/// from disk any valid segment.
+/// from disk any valid segment. See [`Self::new`] for more information on how exactly log is
+/// stored onto disk.
+///
 /// ### Invariants
 /// - The active segment should have index `tail`.
 /// - The segments in memory should have contiguous indices, though this need not be the case for
@@ -26,28 +28,33 @@ use segment::Segment;
 ///   max_segment_size by more than the overflowing bytes of the last packet.
 pub struct CommitLog {
     /// The index at which segments of memory start.
-    pub head: u64,
+    head: u64,
     /// The index at which the current active segment is, and also marks the last valid segment as
     /// well as last segment in memory.
-    pub tail: u64,
+    tail: u64,
     /// Maximum size of any segment in memory.
-    pub max_segment_size: u64,
+    max_segment_size: u64,
     /// Maximum number of segments in memory, apart from the active segment.
-    pub max_segments: u64,
+    max_segments: u64,
     /// The active segment, to which incoming [`Bytes`] are appended to. Note that the bytes are
     /// themselves not mutable.
-    pub active_segment: Segment,
+    active_segment: Segment,
     /// Total size of active segment, used for enforcing the contraints.
-    pub segments: FnvHashMap<u64, Segment>,
+    segments: FnvHashMap<u64, Segment>,
     /// Total size of segments in memory apart from active_segment, used for enforcing the
     /// contraints.
-    pub segments_size: u64,
+    segments_size: u64,
     /// A set of opened file handles to all the segments stored onto the disk. This is optional.
-    pub disk_handler: Option<DiskHandler>,
+    disk_handler: Option<DiskHandler>,
     // TODO: add max_index_file_size?
 }
 
 impl CommitLog {
+    /// Create a new `CommitLog` with given contraints. If `None` is passed in for `dir` argument,
+    /// there will be no logs on the disk, and when memory limit is reached the segment at
+    /// `self.head` will be removed. If a valid path is passed, the directory will be created if
+    /// does not exist, and the segment at `self.head` will be stored onto disk instead of simply
+    /// being deleted.
     pub fn new(max_segment_size: u64, max_segments: u64, dir: Option<PathBuf>) -> io::Result<Self> {
         if max_segment_size < 1024 {
             Err(io::Error::new(
@@ -85,6 +92,7 @@ impl CommitLog {
         }
     }
 
+    /// Append a new [`Bytes`] to the active segment.
     #[inline]
     pub fn append(&mut self, bytes: Bytes) -> io::Result<(u64, u64)> {
         self.apply_retention()?;
@@ -92,7 +100,7 @@ impl CommitLog {
         Ok((self.tail, self.active_segment.len() as u64))
     }
 
-    pub fn apply_retention(&mut self) -> io::Result<()> {
+    fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
             if self.segments.len() as u64 >= self.max_segments {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
@@ -118,6 +126,7 @@ impl CommitLog {
         Ok(())
     }
 
+    /// Read a single [`Bytes`] from the logs.
     pub fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
         if index < self.head {
             if let Some(handler) = self.disk_handler.as_mut() {
@@ -169,6 +178,7 @@ impl CommitLog {
         }
     }
 
+    /// Read vector of [`Bytes`] from the logs.
     pub fn readv(
         &mut self,
         mut index: u64,
