@@ -8,24 +8,33 @@ use fnv::FnvHashMap;
 
 mod chunk;
 mod index;
-mod invalid;
 mod segment;
 
 use chunk::Chunk;
-use invalid::InvalidFile;
-pub use invalid::InvalidType;
 
 /// A wrapper around all index and segment files on the disk.
+#[allow(dead_code)]
 pub(super) struct DiskHandler {
     /// Hashmap for file handlers of index and segment files.
     chunks: FnvHashMap<u64, Chunk>,
-    /// The directory in which to store files in.
+    /// Directory in which to store files in.
     dir: PathBuf,
-    /// The starting index of segment files.
+    /// Starting index of segment files.
     head: u64,
-    /// The ending index of segment files.
+    /// Ending index of segment files.
     tail: u64,
-    invalid_files: Vec<InvalidFile>,
+    /// Invalid files.
+    invalid_files: Vec<InvalidType>,
+}
+
+// TODO: document this, also also the hierarchy or InvalidType.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum InvalidType {
+    InvalidName(PathBuf),
+    NoIndex(u64),
+    NoSegment(u64),
+    InvalidChecksum(u64),
 }
 
 //TODO: Review all unwraps
@@ -34,9 +43,8 @@ impl DiskHandler {
     /// REVIEW: Documentation specifying return of inmemory head
     pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
         struct FileStatus {
-            pub(super) index_found: bool,
+            index_found: bool,
             segment_found: bool,
-            checksum_matched: bool,
         }
 
         // creating and reading given dir
@@ -55,10 +63,7 @@ impl DiskHandler {
                 // TODO: is this unwrap fine?
                 Some(s) => s.to_str().unwrap(),
                 None => {
-                    invalid_files.push(InvalidFile {
-                        path,
-                        error_type: InvalidType::InvalidName,
-                    });
+                    invalid_files.push(InvalidType::InvalidName(path));
                     continue;
                 }
             };
@@ -66,10 +71,7 @@ impl DiskHandler {
             let offset = match file_index.parse::<u64>() {
                 Ok(n) => n,
                 Err(_) => {
-                    invalid_files.push(InvalidFile {
-                        path,
-                        error_type: InvalidType::InvalidName,
-                    });
+                    invalid_files.push(InvalidType::InvalidName(path));
                     continue;
                 }
             };
@@ -86,7 +88,6 @@ impl DiskHandler {
                             FileStatus {
                                 index_found: true,
                                 segment_found: false,
-                                checksum_matched: false,
                             },
                         );
                     }
@@ -101,15 +102,11 @@ impl DiskHandler {
                             FileStatus {
                                 index_found: false,
                                 segment_found: true,
-                                checksum_matched: false,
                             },
                         );
                     }
                 }
-                _ => invalid_files.push(InvalidFile {
-                    path,
-                    error_type: InvalidType::InvalidName,
-                }),
+                _ => invalid_files.push(InvalidType::InvalidName(path)),
             }
 
             indices.push(offset);
@@ -131,22 +128,15 @@ impl DiskHandler {
             FileStatus {
                 index_found,
                 segment_found,
-                checksum_matched,
             },
         ) in statuses.into_iter()
         {
             if !index_found {
-                invalid_files.push(InvalidFile {
-                    path: dir.as_ref().into().join(format!("{:020}", index).as_str()),
-                    error_type: InvalidType::NoIndex(index),
-                });
+                invalid_files.push(InvalidType::NoIndex(index));
             } else if !segment_found {
-                invalid_files.push(InvalidFile {
-                    path: dir.as_ref().into().join(format!("{:020}", index).as_str()),
-                    error_type: InvalidType::NoSegment(index),
-                });
+                invalid_files.push(InvalidType::NoSegment(index));
             } else {
-                chunks.insert(index, Chunk::new(dir, index)?);
+                chunks.insert(index, Chunk::new(&dir, index)?);
             }
         }
 
@@ -156,8 +146,8 @@ impl DiskHandler {
                 chunks,
                 dir: dir.as_ref().into(),
                 head,
-                tail: inmemory_head,
-                invalid_files
+                tail,
+                invalid_files,
             },
         ))
     }
@@ -192,14 +182,14 @@ impl DiskHandler {
 
     /// Read `len` packets, starting from the given offset in segment at given index. Does not care
     /// about segment boundaries, and will keep on reading until length is met or we run out of
-    /// packets. Returns the number of packets left to read, but were not found, and the index of
-    /// next segment if exists.
+    /// packets. Returns the number of packets left to read (which can be 0), but were not found,
+    /// and the index of next segment if exists.
     #[inline]
     pub(super) fn readv(
         &mut self,
         index: u64,
         offset: u64,
-        mut len: u64,
+        len: u64,
         out: &mut Vec<Bytes>,
     ) -> io::Result<(u64, Option<u64>)> {
         let chunk = if let Some(disk_segment) = self.chunks.get_mut(&index) {
@@ -210,34 +200,45 @@ impl DiskHandler {
                 format!("given index {} does not exists on disk", index).as_str(),
             ));
         };
-        len = chunk.readv(offset, len, out)?;
+        let mut left = chunk.readv(offset, len, out)?;
 
         // REVIEW: Use segments hashmap instead of binary_search
         // as we find segment at `index` in self.chunks, it must exist in self.indices
-        let mut segment_idx = self.indices.binary_search(&index).unwrap();
+        let mut segment_idx = index;
 
-        if len == 0 {
-            segment_idx += 1;
-            if segment_idx >= self.indices.len() {
-                return Ok((0, None));
-            } else {
-                return Ok((0, Some(segment_idx as u64)));
+        if left == 0 {
+            // if no more packets left in `chunk`, move onto next
+            if offset + len >= chunk.entries() {
+                segment_idx += 1;
+                while self.chunks.get(&segment_idx).is_none() {
+                    segment_idx += 1;
+                    if segment_idx > self.tail {
+                        return Ok((left, None));
+                    }
+                }
             }
+
+            return Ok((0, Some(segment_idx as u64)));
         }
 
-        while len > 0 {
+        while left > 0 {
             segment_idx += 1;
-            if segment_idx >= self.indices.len() {
-                return Ok((len, None));
+            while self.chunks.get(&segment_idx).is_none() {
+                segment_idx += 1;
+                if segment_idx > self.tail {
+                    return Ok((left, None));
+                }
             }
-            len = self
+
+            // unwrap fine as we already validated the index in the while loop
+            left = self
                 .chunks
-                .get_mut(&self.indices[segment_idx])
+                .get_mut(&segment_idx)
                 .unwrap()
-                .readv(0, len, out)?;
+                .readv(0, left, out)?;
         }
 
-        Ok((0, Some(self.indices[segment_idx])))
+        Ok((0, Some(segment_idx)))
 
         // There are three possible cases for return of Ok(_):
         // 1.) len = 0, next = Some(_)
@@ -255,7 +256,11 @@ impl DiskHandler {
         let mut chunk = Chunk::new(&self.dir, index)?;
         let res = chunk.appendv(data)?;
         self.chunks.insert(index, chunk);
-        self.indices.push(index);
+
+        if index > self.tail {
+            self.tail = index;
+        }
+
         Ok(res)
     }
 

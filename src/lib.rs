@@ -6,7 +6,6 @@ use fnv::FnvHashMap;
 mod disk;
 mod segment;
 use disk::DiskHandler;
-use log::debug;
 use segment::Segment;
 
 /// The log which can store commits in memory, and push them onto disk when needed, as well as read
@@ -224,7 +223,6 @@ impl CommitLog {
         let mut out = Vec::with_capacity(len as usize);
         loop {
             if index < self.head {
-                debug!("disk called");
                 if let Some(handler) = self.disk_handler.as_mut() {
                     // REVIEW: Instead of looping to jump from disk to memory,
                     // check 'out' len and if it has less than what is asked for
@@ -236,7 +234,6 @@ impl CommitLog {
                     index = next_index.unwrap_or(self.head);
                     // start from beginning of next segment
                     offset = 0;
-                    debug!("disk fine");
                 } else {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -244,7 +241,6 @@ impl CommitLog {
                     ));
                 }
             } else if index < self.tail {
-                debug!("segment called");
                 let segment = self.segments.get(&index).unwrap();
                 if offset >= segment.len() as u64 {
                     return Err(io::Error::new(
@@ -261,9 +257,7 @@ impl CommitLog {
                 index += 1;
                 // start from beginning of next segment
                 offset = 0;
-                debug!("segment fine");
             } else if index == self.tail {
-                debug!("active_segment called");
                 if offset > self.active_segment.len() as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -275,7 +269,6 @@ impl CommitLog {
                     ));
                 }
                 len = self.active_segment.readv(offset, len, &mut out);
-                debug!("active_segment fine");
                 // we have read from active segment as well. even if len not satisfied, we can not
                 // read further so break anyway.
                 break;
@@ -300,7 +293,6 @@ impl CommitLog {
 #[cfg(test)]
 mod test {
     use bytes::{Bytes, BytesMut};
-    use log::debug;
     use mqttbytes::{
         v4::{read, ConnAck, ConnectReturnCode::Success, Packet, Publish, Subscribe},
         QoS,
@@ -483,8 +475,7 @@ mod test {
 
         let mut offset = 0;
         let mut index = 0;
-        for i in 0..100 {
-            debug!("{}", i);
+        for _ in 0..100 {
             let v = log.readv(index, offset, 16).unwrap();
             index = v.1;
             offset = v.2;

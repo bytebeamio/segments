@@ -57,7 +57,6 @@ impl Index {
     }
 
     /// Return the index at which next call to [`Index::append`] will append to.
-    #[cfg(test)]
     #[inline(always)]
     pub(super) fn entries(&self) -> u64 {
         self.tail
@@ -80,8 +79,12 @@ impl Index {
     /// return tuple the number of packets still left to read.
     #[inline]
     pub(super) fn readv(&mut self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
-        let left = if len > self.tail { len - self.tail } else { 0 };
-        let len = len as usize;
+        let limit = index + len;
+        let (left, len) = if limit > self.tail {
+            (limit - self.tail, (self.tail - index) as usize)
+        } else {
+            (0, len as usize)
+        };
         let mut buf = Vec::with_capacity(len);
         self.file.seek(SeekFrom::Start(index * ENTRY_SIZE))?;
 

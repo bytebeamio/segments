@@ -69,11 +69,11 @@ impl Chunk {
         self.segment.append(buf.freeze())
     }
 
-    // /// Total number of packet appended.
-    // #[inline(always)]
-    // pub(super) fn entries(&self) -> u64 {
-    //     self.index.entries()
-    // }
+    /// Total number of packet appended.
+    #[inline(always)]
+    pub(super) fn entries(&self) -> u64 {
+        self.index.entries()
+    }
 
     /// Flush the contents to disk.
     #[inline(always)]
