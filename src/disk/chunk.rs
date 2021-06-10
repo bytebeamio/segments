@@ -1,10 +1,6 @@
-use std::{
-    io::{self, Read, Seek, Write},
-    path::Path,
-};
+use std::{io, path::Path};
 
 use bytes::{Bytes, BytesMut};
-use log::debug;
 
 use super::{index::Index, segment::Segment};
 
@@ -33,10 +29,7 @@ impl Chunk {
         let index = Index::new(index_path)?;
         let segment = Segment::new(segment_path)?;
 
-        Ok(Self {
-            index,
-            segment,
-        })
+        Ok(Self { index, segment })
     }
 
     /// Read a packet from the disk segment at the particular index.
@@ -56,6 +49,7 @@ impl Chunk {
     }
 
     /// Appned a packet to the disk segment. Does not check for any size limit.
+    #[cfg(test)]
     #[inline]
     pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
         self.index.append(bytes.len() as u64)?;
@@ -75,11 +69,11 @@ impl Chunk {
         self.segment.append(buf.freeze())
     }
 
-    /// Total number of packet appended.
-    #[inline(always)]
-    pub(super) fn entries(&self) -> u64 {
-        self.index.entries()
-    }
+    // /// Total number of packet appended.
+    // #[inline(always)]
+    // pub(super) fn entries(&self) -> u64 {
+    //     self.index.entries()
+    // }
 
     /// Flush the contents to disk.
     #[inline(always)]

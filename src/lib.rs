@@ -1,11 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables)]
-
-use std::{
-    fs::{self, File, OpenOptions},
-    io,
-    iter::Iterator,
-    path::{Path, PathBuf},
-};
+use std::{io, path::PathBuf};
 
 use bytes::Bytes;
 use fnv::FnvHashMap;
@@ -92,12 +85,41 @@ impl CommitLog {
         }
     }
 
+    /// Get the number of segment on the disk.
+    #[inline]
+    pub fn disk_len(&self) -> io::Result<u64> {
+        Ok(self
+            .disk_handler
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
+            .len())
+    }
+
     /// Append a new [`Bytes`] to the active segment.
     #[inline]
     pub fn append(&mut self, bytes: Bytes) -> io::Result<(u64, u64)> {
         self.apply_retention()?;
         self.active_segment.push(bytes);
         Ok((self.tail, self.active_segment.len() as u64))
+    }
+
+    /// Flush the contents onto the disk. Call this before any reads if disk was opened for logs to
+    /// avoid missing data.
+    #[inline]
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.disk_handler
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
+            .flush()
+    }
+
+    /// Flush the contents onto the disk for a particular segment.
+    #[inline]
+    pub fn flush_at(&mut self, index: u64) -> io::Result<()> {
+        self.disk_handler
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
+            .flush_at(index)
     }
 
     fn apply_retention(&mut self) -> io::Result<()> {
@@ -127,6 +149,10 @@ impl CommitLog {
     }
 
     /// Read a single [`Bytes`] from the logs.
+    ///
+    /// #### Note
+    /// `read` requires a mutable reference to self as we might need to push data to disk, which
+    /// requires mutable access to corresponding file handler.
     pub fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
         if index < self.head {
             if let Some(handler) = self.disk_handler.as_mut() {
@@ -179,6 +205,10 @@ impl CommitLog {
     }
 
     /// Read vector of [`Bytes`] from the logs.
+    ///
+    /// #### Note
+    /// `readv` requires a mutable reference to self as we might need to push data to disk, which
+    /// requires mutable access to corresponding file handler.
     pub fn readv(
         &mut self,
         mut index: u64,
@@ -194,7 +224,7 @@ impl CommitLog {
                     len = new_len;
                     // start reading from memory in next iteration if no segment left to read on
                     // disk
-                    let index = next_index.unwrap_or(self.head);
+                    index = next_index.unwrap_or(self.head);
                     // start from beginning of next segment
                     offset = 0;
                     debug!("disk fine");
@@ -260,16 +290,11 @@ impl CommitLog {
 
 #[cfg(test)]
 mod test {
-    use std::{
-        fs::{File, OpenOptions},
-        io::{Read, Write},
-    };
-
-    use bytes::{Buf, Bytes, BytesMut};
+    use bytes::{Bytes, BytesMut};
     use log::debug;
     use mqttbytes::{
         v4::{read, ConnAck, ConnectReturnCode::Success, Packet, Publish, Subscribe},
-        FixedHeader, QoS,
+        QoS,
     };
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
@@ -351,7 +376,7 @@ mod test {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
 
-        for i in 0..5 {
+        for _ in 0..5 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -360,7 +385,7 @@ mod test {
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 5);
         assert_eq!(log.active_segment.size() as usize, len * 5);
 
-        for i in 0..5 {
+        for _ in 0..5 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -375,7 +400,7 @@ mod test {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
 
-        for i in 0..7 {
+        for _ in 0..7 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -384,7 +409,7 @@ mod test {
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
         assert_eq!(log.active_segment.size() as usize, len * 7);
 
-        for i in 0..70 {
+        for _ in 0..70 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -406,7 +431,7 @@ mod test {
         let dir = tempdir().unwrap();
         let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
 
-        for i in 0..5 {
+        for _ in 0..5 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -415,7 +440,7 @@ mod test {
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 5);
         assert_eq!(log.active_segment.size() as usize, len * 5);
 
-        for i in 0..70 {
+        for _ in 0..70 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }
@@ -435,7 +460,7 @@ mod test {
         let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
 
         // 160 packets in active_segment, 800 packets in segment, 640 packets in disk
-        for i in 0..100 {
+        for _ in 0..100 {
             for byte in ranpack_bytes.clone() {
                 log.append(byte).unwrap();
             }

@@ -1,12 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use bytes::Bytes;
 use fnv::FnvHashMap;
-use log::debug;
 
 mod chunk;
 mod index;
@@ -57,11 +55,20 @@ impl DiskHandler {
         ))
     }
 
-    /// Return the total number of segments.
+    /// Returns the total number of segments.
     #[inline]
     pub(super) fn len(&self) -> u64 {
         self.chunks.len() as u64
     }
+
+    // /// Returns the number of entries for a particular segment.
+    // #[inline]
+    // pub(super) fn len_at(&self, index: u64) -> io::Result<u64> {
+    //     Ok(self.chunks.get(&index).ok_or(io::Error::new(
+    //             io::ErrorKind::Other,
+    //             "No elemt at the given index",
+    //         ))?.entries())
+    // }
 
     /// Read a single packet from given offset in segment at given index.
     #[inline]
@@ -157,10 +164,12 @@ impl DiskHandler {
     pub(super) fn flush_at(&mut self, index: u64) -> io::Result<()> {
         self.chunks
             .get_mut(&index)
-            .ok_or(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("flushing at invalid index {}", index).as_str(),
-            ))?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("flushing at invalid index {}", index).as_str(),
+                )
+            })?
             .flush()
     }
 }
@@ -168,13 +177,11 @@ impl DiskHandler {
 #[cfg(test)]
 mod test {
     use bytes::Bytes;
-    use log::debug;
-    use mqttbytes::v5;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
     use super::*;
-    use crate::test::{init_logging, random_packets_as_bytes, verify_bytes_as_random_packets};
+    use crate::test::{random_packets_as_bytes, verify_bytes_as_random_packets};
 
     #[test]
     fn push_and_read_handler() {
@@ -204,7 +211,7 @@ mod test {
             handler
                 .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
                 .unwrap();
-            for j in 0..=i {
+            for _ in 0..=i {
                 let u = v.split_off(ranpack_bytes.len());
                 verify_bytes_as_random_packets(u, ranpack_bytes.len());
             }
@@ -240,7 +247,7 @@ mod test {
             handler
                 .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
                 .unwrap();
-            for j in 0..=i {
+            for _ in 0..=i {
                 let u = v.split_off(ranpack_bytes.len());
                 verify_bytes_as_random_packets(u, ranpack_bytes.len());
             }

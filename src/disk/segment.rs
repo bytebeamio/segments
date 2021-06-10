@@ -5,9 +5,6 @@ use std::{
 };
 
 use bytes::{Bytes, BytesMut};
-use log::debug;
-
-use super::index::Index;
 
 /// Wrapper around the segment file.
 #[derive(Debug)]
@@ -45,6 +42,7 @@ impl Segment {
         })
     }
 
+    #[cfg(test)]
     #[inline]
     /// Returns the size of the file the segment is holding.
     pub(super) fn size(&self) -> u64 {
@@ -79,7 +77,6 @@ impl Segment {
     /// Get packets from given vector of indices and corresponding lens.
     #[inline]
     pub(super) fn readv(&mut self, offsets: Vec<[u64; 2]>, out: &mut Vec<Bytes>) -> io::Result<()> {
-        let len = offsets.len();
         let total = if let Some(first) = offsets.first() {
             let mut total = first[1];
             for offset in offsets.iter().skip(1) {

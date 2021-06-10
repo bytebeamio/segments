@@ -1,11 +1,10 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, Seek, SeekFrom},
     path::Path,
 };
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use log::{debug, info, warn};
 
 /// Size of the offset of packet, in bytes.
 const OFFSET_SIZE: u64 = 8;
@@ -50,18 +49,16 @@ impl Index {
             last_entry: (0, 0),
         };
 
-        if tail == 0 {
-            Ok(index)
-        } else {
+        if tail != 0 {
             let [offset, len] = index.read(tail - 1)?;
             index.last_entry = (offset, len);
-            Ok(index)
         }
+        Ok(index)
     }
 
     /// Return the index at which next call to [`Index::append`] will append to.
+    #[cfg(test)]
     #[inline(always)]
-
     pub(super) fn entries(&self) -> u64 {
         self.tail
     }

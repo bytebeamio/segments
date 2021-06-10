@@ -5,13 +5,16 @@ use bytes::Bytes;
 #[derive(Debug)]
 pub(super) struct Segment {
     data: Vec<Bytes>,
-    size: u64
+    size: u64,
 }
 
 impl Segment {
     #[inline]
     pub(super) fn with_capacity(capacity: u64) -> Self {
-        Self { data: Vec::with_capacity(capacity as usize), size: 0 }
+        Self {
+            data: Vec::with_capacity(capacity as usize),
+            size: 0,
+        }
     }
 
     #[inline]
