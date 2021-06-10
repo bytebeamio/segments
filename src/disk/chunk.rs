@@ -9,11 +9,12 @@ use log::debug;
 use super::{index::Index, segment::Segment};
 
 /// The handler for a segment file which is on the disk, and it's corresponding index file.
+#[derive(Debug)]
 pub(super) struct Chunk {
     /// The handle for index file.
-    index: Index,
+    pub(super) index: Index,
     /// The handle for segment file.
-    segment: Segment,
+    pub(super) segment: Segment,
 }
 
 impl Chunk {
@@ -84,6 +85,13 @@ impl Chunk {
     #[inline(always)]
     pub(super) fn flush(&mut self) -> io::Result<()> {
         self.segment.flush()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn real_segment_size(self) -> io::Result<(Self, u64)> {
+        let Self { segment, index } = self;
+        let (segment, ret) = segment.actual_size()?;
+        Ok((Self { index, segment }, ret))
     }
 }
 

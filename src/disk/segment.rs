@@ -10,6 +10,7 @@ use log::debug;
 use super::index::Index;
 
 /// Wrapper around the segment file.
+#[derive(Debug)]
 pub(super) struct Segment {
     /// A buffered reader for the segment file.
     reader: BufReader<File>,
@@ -116,7 +117,7 @@ impl Segment {
     }
 
     #[cfg(test)]
-    fn actual_size(self) -> io::Result<(Self, u64)> {
+    pub(crate) fn actual_size(self) -> io::Result<(Self, u64)> {
         let Self {
             reader,
             writer,

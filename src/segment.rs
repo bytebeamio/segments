@@ -1,5 +1,8 @@
 use bytes::Bytes;
 
+// TODO: document all this
+
+#[derive(Debug)]
 pub(super) struct Segment {
     data: Vec<Bytes>,
     size: u64

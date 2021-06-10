@@ -22,6 +22,7 @@ pub const ENTRY_SIZE: u64 = OFFSET_SIZE + LEN_SIZE;
 /// #### Note
 /// It is the duty of the handler of this struct to ensure index file's size does not exceed the
 /// specified limit.
+#[derive(Debug)]
 pub(super) struct Index {
     /// The opened index file.
     file: File,

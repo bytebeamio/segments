@@ -6,6 +6,7 @@ use std::{
 
 use bytes::Bytes;
 use fnv::FnvHashMap;
+use log::debug;
 
 mod chunk;
 mod index;
@@ -65,8 +66,8 @@ impl DiskHandler {
     /// Read a single packet from given offset in segment at given index.
     #[inline]
     pub(super) fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
-        if let Some(disk_segment) = self.chunks.get_mut(&index) {
-            disk_segment.read(offset)
+        if let Some(chunk) = self.chunks.get_mut(&index) {
+            chunk.read(offset)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -87,7 +88,7 @@ impl DiskHandler {
         mut len: u64,
         out: &mut Vec<Bytes>,
     ) -> io::Result<(u64, Option<u64>)> {
-        let disk_segment = if let Some(disk_segment) = self.chunks.get_mut(&index) {
+        let chunk = if let Some(disk_segment) = self.chunks.get_mut(&index) {
             disk_segment
         } else {
             return Err(io::Error::new(
@@ -95,10 +96,19 @@ impl DiskHandler {
                 format!("given index {} does not exists on disk", index).as_str(),
             ));
         };
-        len = disk_segment.readv(offset, len, out)?;
+        len = chunk.readv(offset, len, out)?;
 
         // as we find segment at `index` in self.chunks, it must exist in self.indices
         let mut segment_idx = self.indices.binary_search(&index).unwrap();
+
+        if len == 0 {
+            segment_idx += 1;
+            if segment_idx >= self.indices.len() {
+                return Ok((0, None));
+            } else {
+                return Ok((0, Some(segment_idx as u64)));
+            }
+        }
 
         while len > 0 {
             segment_idx += 1;
@@ -112,9 +122,9 @@ impl DiskHandler {
                 .readv(0, len, out)?;
         }
 
-        Ok((len, Some(self.indices[segment_idx])))
+        Ok((0, Some(self.indices[segment_idx])))
 
-        // There are three possible cases only:
+        // There are three possible cases for return of Ok(_):
         // 1.) len = 0, next = Some(_)
         //     => we still have segment left to read, but len reached
         // 2.) len = 0, next = None
@@ -127,9 +137,10 @@ impl DiskHandler {
     /// segment at the given index.
     #[inline]
     pub(super) fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<u64> {
-        let mut disk_segment = Chunk::new(&self.dir, index)?;
-        let res = disk_segment.appendv(data)?;
-        self.chunks.insert(index, disk_segment);
+        let mut chunk = Chunk::new(&self.dir, index)?;
+        let res = chunk.appendv(data)?;
+        self.chunks.insert(index, chunk);
+        self.indices.push(index);
         Ok(res)
     }
 
@@ -152,6 +163,14 @@ impl DiskHandler {
             ))?
             .flush()
     }
+
+    #[cfg(test)]
+    fn real_segment_size(&mut self, index: u64) -> io::Result<u64> {
+        let temp = self.chunks.remove(&index).unwrap();
+        let (temp, ret) = temp.real_segment_size()?;
+        self.chunks.insert(index, temp);
+        Ok(ret)
+    }
 }
 
 #[cfg(test)]
@@ -163,20 +182,119 @@ mod test {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::test::random_packets;
+    use crate::test::{init_logging, random_packets_as_bytes, verify_bytes_as_random_packets};
 
     #[test]
     fn push_and_read_handler() {
         let dir = tempdir().unwrap();
-        let (tail, mut handler) = DiskHandler::new(dir.path()).unwrap();
-        let ranpacks = random_packets();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
 
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (19, [len] * 20 packets)
+        //
+        // where [len] = ranpack_bytes.len()
         for i in 0..20 {
-            let v = Vec::with_capacity(i);
-            for j in 0..=i {
-                // v.extend(ranpacks.clone().into_iter().map(|packet| packet.into()));
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(ranpack_bytes.clone().into_iter());
             }
             handler.insert(i as u64, v).unwrap();
         }
+
+        handler.flush().unwrap();
+
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for j in 0..=i {
+                let u = v.split_off(ranpack_bytes.len());
+                verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn push_and_read_handler_after_drop() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
+
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (19, [len] * 20 packets)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..20 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(ranpack_bytes.clone().into_iter());
+            }
+            handler.insert(i as u64, v).unwrap();
+        }
+
+        drop(handler);
+
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for j in 0..=i {
+                let u = v.split_off(ranpack_bytes.len());
+                verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn read_handler_from_returned_index() {
+        init_logging();
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
+
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (14, [len] * 15 packets)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..15 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(ranpack_bytes.clone().into_iter());
+            }
+            handler.insert(i as u64, v).unwrap();
+        }
+
+        handler.flush().unwrap();
+
+        let mut v = Vec::new();
+        let (mut left, mut ret) = handler.readv(0, 0, 10, &mut v).unwrap();
+        verify_bytes_as_random_packets(v, 10);
+        let mut offset = 0;
+        let mut v: Vec<Bytes> = Vec::new();
+
+        while let Some(seg) = ret {
+            v.clear();
+            offset = if left > 0 { 0 } else { offset + 10 };
+            debug!("seg {} offset {}", seg, offset);
+            let (new_left, new_ret) = handler.readv(seg, offset, 10, &mut v).unwrap();
+            left = new_left;
+            ret = new_ret;
+            debug!("seg {}", seg);
+        }
+
+        assert_eq!(left, 0);
     }
 }

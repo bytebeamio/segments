@@ -13,6 +13,7 @@ use fnv::FnvHashMap;
 mod disk;
 mod segment;
 use disk::DiskHandler;
+use log::debug;
 use segment::Segment;
 
 /// The log which can store commits in memory, and push them onto disk when needed, as well as read
@@ -47,11 +48,7 @@ pub struct CommitLog {
 }
 
 impl CommitLog {
-    pub fn new<P: AsRef<Path>>(
-        max_segment_size: u64,
-        max_segments: u64,
-        dir: Option<P>,
-    ) -> io::Result<Self> {
+    pub fn new(max_segment_size: u64, max_segments: u64, dir: Option<PathBuf>) -> io::Result<Self> {
         if max_segment_size < 1024 {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -96,8 +93,8 @@ impl CommitLog {
     }
 
     fn apply_retention(&mut self) -> io::Result<()> {
-        if self.active_segment.len() > self.max_segment_size {
-            if self.segments_size > self.max_segment_size {
+        if self.active_segment.size() >= self.max_segment_size {
+            if self.segments_size >= self.max_segment_size {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
 
                 if let Some(files) = self.disk_handler.as_mut() {
@@ -112,6 +109,7 @@ impl CommitLog {
                 &mut self.active_segment,
                 Segment::with_capacity(self.max_segment_size),
             );
+            self.segments_size += old_segment.size();
             self.segments.insert(self.tail, old_segment);
             self.tail += 1;
         }
@@ -250,11 +248,18 @@ mod test {
         io::{Read, Write},
     };
 
-    use mqttbytes::{v4::Publish, QoS};
+    use bytes::{Buf, Bytes, BytesMut};
+    use log::debug;
+    use mqttbytes::{
+        v4::{read, ConnAck, ConnectReturnCode::Success, Packet, Publish, Subscribe},
+        FixedHeader, QoS,
+    };
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
 
     use super::*;
 
-    pub fn init_logging() {
+    pub(crate) fn init_logging() {
         use simplelog::{
             ColorChoice, CombinedLogger, Config, LevelFilter, TermLogger, TerminalMode,
         };
@@ -268,37 +273,139 @@ mod test {
         )]);
     }
 
+    // Total size of all packets = 197 bytes
     #[rustfmt::skip]
-    pub fn random_packets() -> Vec<Publish> {
+    #[inline]
+    pub(crate) fn random_packets() -> Vec<Packet> {
         vec![
-            Publish::new("broker1", QoS::AtLeastOnce, "payload1".to_string()),
-            Publish::new("broker2", QoS::ExactlyOnce, "payload2".to_string()),
-            Publish::new("broker3", QoS::AtMostOnce , "payload3".to_string()),
-            Publish::new("broker4", QoS::AtMostOnce , "payload4".to_string()),
-            Publish::new("broker5", QoS::AtLeastOnce, "payload5".to_string()),
+            Packet::Publish  (Publish::new  ("broker1", QoS::AtMostOnce , "ayoad1" )),
+            Packet::Publish  (Publish::new  ("brker2" , QoS::AtMostOnce , "pyload2")),
+            Packet::Subscribe(Subscribe::new("broker1", QoS::AtMostOnce            )),
+            Packet::Publish  (Publish::new  ("brr3"   , QoS::AtMostOnce , "pyload3")),
+            Packet::Publish  (Publish::new  ("bruuuu4", QoS::AtMostOnce , "pyload4")),
+            Packet::ConnAck  (ConnAck::new  (Success  , true                       )),
+            Packet::ConnAck  (ConnAck::new  (Success  , true                       )),
+            Packet::Publish  (Publish::new  ("brrrr5" , QoS::AtMostOnce , "paylad5")),
+            Packet::ConnAck  (ConnAck::new  (Success  , true                       )),
+            Packet::Publish  (Publish::new  ("bro44r6", QoS::AtMostOnce , "aylad6" )),
+            Packet::Subscribe(Subscribe::new("broker7", QoS::AtMostOnce            )),
+            Packet::Publish  (Publish::new  ("broker7", QoS::AtMostOnce , "paylad7")),
+            Packet::Publish  (Publish::new  ("b8"     , QoS::AtMostOnce , "payl8"  )),
+            Packet::Subscribe(Subscribe::new("b8"     , QoS::AtMostOnce            )),
+            Packet::Subscribe(Subscribe::new("bro44r6", QoS::AtMostOnce            )),
+            Packet::ConnAck  (ConnAck::new  (Success  , true                       )),
         ]
     }
 
-    // TODO: write these tests
+    pub(crate) fn random_packets_as_bytes() -> (Vec<Bytes>, usize) {
+        let ranpacks = random_packets();
+        let mut bytes = Vec::with_capacity(ranpacks.len());
+        let mut total_len = 0;
+        for packet in ranpacks.into_iter() {
+            let mut byte = BytesMut::default();
+            match packet {
+                Packet::Publish(p) => {
+                    p.write(&mut byte).unwrap();
+                }
+                Packet::Subscribe(p) => {
+                    p.write(&mut byte).unwrap();
+                }
+                Packet::ConnAck(p) => {
+                    p.write(&mut byte).unwrap();
+                }
+                _ => panic!("unexpected packet type"),
+            }
+            total_len += byte.len();
+            bytes.push(byte.freeze());
+        }
+        (bytes, total_len)
+    }
 
+    pub(crate) fn verify_bytes_as_random_packets(bytes: Vec<Bytes>, take: usize) {
+        let ranpacks = random_packets();
+        for (ranpack, byte) in ranpacks.into_iter().zip(bytes.into_iter()).take(take) {
+            let readpack = read(&mut BytesMut::from(byte.as_ref()), byte.len()).unwrap();
+            assert_eq!(readpack, ranpack);
+        }
+    }
+
+    #[test]
     fn active_segment_store() {
-        todo!()
-    }
-    fn memory_segment_store() {
-        todo!()
-    }
-    fn disk_segment_store() {
-        todo!()
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
+
+        for i in 0..5 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 5);
+        assert_eq!(log.active_segment.size() as usize, len * 5);
+
+        for i in 0..5 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 10);
+        assert_eq!(log.active_segment.size() as usize, len * 10);
     }
 
-    fn active_segment_store_packet() {
-        todo!()
+    #[test]
+    fn memory_segment_store() {
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
+
+        for i in 0..7 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
+        assert_eq!(log.active_segment.size() as usize, len * 7);
+
+        for i in 0..7 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 4);
+        assert_eq!(log.active_segment.size() as usize, len * 4);
+        assert_eq!(log.segments.get_mut(&0).unwrap().size() as usize, len * 10);
+        assert_eq!(
+            log.segments.get_mut(&0).unwrap().len() as usize,
+            ranpack_bytes.len() * 10
+        );
     }
-    fn memory_segment_store_packet() {
-        todo!()
-    }
-    fn disk_segment_store_packet() {
-        todo!()
+
+    #[test]
+    fn disk_segment_store() {
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let dir = tempdir().unwrap();
+        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+
+        for i in 0..7 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
+        assert_eq!(log.active_segment.size() as usize, len * 7);
+
+        for i in 0..75 {
+            for byte in ranpack_bytes.clone() {
+                log.append(byte).unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, 5);
+        assert_eq!(log.segments_size, len as u64 * 10 * 5);
+        assert_eq!(log.disk_handler.unwrap().len(), 2);
     }
 
     fn active_segment_read() {
@@ -308,16 +415,6 @@ mod test {
         todo!()
     }
     fn disk_segment_read() {
-        todo!()
-    }
-
-    fn active_segment_read_packet() {
-        todo!()
-    }
-    fn memory_segment_read_packet() {
-        todo!()
-    }
-    fn disk_segment_read_packet() {
         todo!()
     }
 }
