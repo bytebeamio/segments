@@ -48,21 +48,21 @@ impl CommitLog {
     /// does not exist, and the segment at `self.head` will be stored onto disk instead of simply
     /// being deleted.
     pub fn new(max_segment_size: u64, max_segments: u64, dir: Option<PathBuf>) -> io::Result<Self> {
-        // REVIEW: Usually early returns are much more readable for exceptions
-        // than long if else chains
         if max_segment_size < 1024 {
-            Err(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "minimum 'max_segment_size' should be 1KB, {} given",
                     max_segment_size,
                 )
                 .as_str(),
-            ))
-        } else if let Some(dir) = dir {
+            ));
+        }
+
+        if let Some(dir) = dir {
             let (head, files) = DiskHandler::new(dir)?;
 
-            Ok(Self {
+            return Ok(Self {
                 head,
                 tail: head,
                 max_segment_size,
@@ -71,19 +71,19 @@ impl CommitLog {
                 segments: FnvHashMap::default(),
                 segments_size: 0,
                 disk_handler: Some(files),
-            })
-        } else {
-            Ok(Self {
-                head: 0,
-                tail: 0,
-                max_segment_size,
-                max_segments,
-                active_segment: Segment::with_capacity(max_segment_size),
-                segments: FnvHashMap::default(),
-                segments_size: 0,
-                disk_handler: None,
-            })
+            });
         }
+
+        Ok(Self {
+            head: 0,
+            tail: 0,
+            max_segment_size,
+            max_segments,
+            active_segment: Segment::with_capacity(max_segment_size),
+            segments: FnvHashMap::default(),
+            segments_size: 0,
+            disk_handler: None,
+        })
     }
 
     /// Get the number of segment on the disk.
@@ -110,10 +110,7 @@ impl CommitLog {
                 let removed_segment = self.segments.remove(&self.head).unwrap();
                 self.segments_size -= removed_segment.size();
 
-                // REVIEW: Inmemory and disk segment sizes are same in our design.
-                // There'll never be a partially filled file. Flush everytime
                 if let Some(files) = self.disk_handler.as_mut() {
-                    // REVIEW: Add checksum
                     files.insert(self.head, removed_segment.into_data())?;
                 }
 
@@ -139,54 +136,61 @@ impl CommitLog {
     /// `read` requires a mutable reference to self as we might need to push data to disk, which
     /// requires mutable access to corresponding file handler.
     pub fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
+        if index > self.tail {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        // in disk
         if index < self.head {
             if let Some(handler) = self.disk_handler.as_mut() {
-                handler.read(index, offset)
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("segment with given index {} not found", index).as_str(),
-                ))
+                return handler.read(index, offset);
             }
-        } else if index < self.tail {
+
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        // in memory segment
+        if index < self.tail {
             if let Some(segment) = self.segments.get(&index) {
                 if index > segment.len() as u64 {
-                    Err(io::Error::new(
+                    return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
                             "byte at offset {} not found for segment at {}",
                             offset, index
                         )
                         .as_str(),
-                    ))
-                } else {
-                    Ok(segment.at(index))
+                    ));
                 }
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("segment with given index {} not found", index).as_str(),
-                ))
+
+                return Ok(segment.at(index));
             }
-        } else if index == self.tail {
-            if index > self.active_segment.len() as u64 {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "byte at offset {} not found for segment at {}",
-                        offset, index
-                    )
-                    .as_str(),
-                ))
-            } else {
-                Ok(self.active_segment.at(index))
-            }
-        } else {
-            Err(io::Error::new(
+
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("segment with given index {} not found", index).as_str(),
-            ))
+            ));
         }
+
+        // in active segment
+        if index > self.active_segment.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "byte at offset {} not found for segment at {}",
+                    offset, index
+                )
+                .as_str(),
+            ));
+        }
+
+        Ok(self.active_segment.at(index))
     }
 
     /// Read vector of [`Bytes`] from the logs.
@@ -195,79 +199,85 @@ impl CommitLog {
     /// `readv` requires a mutable reference to self as we might need to push data to disk, which
     /// requires mutable access to corresponding file handler.
     pub fn readv(
-        &mut self,
+        &self,
         mut index: u64,
         mut offset: u64,
-        mut len: u64,
+        len: u64,
     ) -> io::Result<(Vec<Bytes>, u64, u64, u64)> {
-        // REVIEW: let mut remaining_len = len;
-        let mut out = Vec::with_capacity(len as usize);
-        loop {
-            if index < self.head {
-                if let Some(handler) = self.disk_handler.as_mut() {
-                    // REVIEW: Instead of looping to jump from disk to memory,
-                    // check 'out' len and if it has less than what is asked for
-                    // , do inmemory handling. Otherwise early return
-                    let (new_len, next_index) = handler.readv(index, offset, len, &mut out)?;
-                    len = new_len;
-                    // start reading from memory in next iteration if no segment left to read on
-                    // disk
-                    index = next_index.unwrap_or(self.head);
-                    // start from beginning of next segment
-                    offset = 0;
-                } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!("segment with given index {} not found", index).as_str(),
-                    ));
-                }
-            } else if index < self.tail {
-                let segment = self.segments.get(&index).unwrap();
-                if offset >= segment.len() as u64 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "byte at offset {} not found for segment at {}",
-                            offset, index
-                        )
-                        .as_str(),
-                    ));
-                }
-                len = segment.readv(index, len, &mut out);
-                // read the next segment, or move onto the active segment
-                index += 1;
+        if index > self.tail {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        let mut remaining_len = len;
+        let mut out = Vec::with_capacity(remaining_len as usize);
+
+        if index < self.head {
+            if let Some(handler) = self.disk_handler.as_ref() {
+                let (new_len, next_index) =
+                    handler.readv(index, offset, remaining_len, &mut out)?;
+
+                remaining_len = new_len;
+                // start reading from memory in next iteration if no segment left to read on
+                // disk
+                index = next_index.unwrap_or(self.head);
                 // start from beginning of next segment
                 offset = 0;
-            } else if index == self.tail {
-                if offset > self.active_segment.len() as u64 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "byte at offset {} not found for segment at {}",
-                            offset, index
-                        )
-                        .as_str(),
-                    ));
-                }
-                len = self.active_segment.readv(offset, len, &mut out);
-                // we have read from active segment as well. even if len not satisfied, we can not
-                // read further so break anyway.
-                break;
             } else {
-                // this case only reached when initially provided index was beyond active segment
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("segment with given index {} not found", index).as_str(),
                 ));
             }
-
-            // meaning we satisfied the len
-            if len == 0 {
-                break;
-            }
         }
 
-        Ok((out, len, index, offset))
+        if remaining_len == 0 {
+            return Ok((out, remaining_len, index, offset));
+        }
+
+        if index < self.tail {
+            let segment = self.segments.get(&index).unwrap();
+            if offset >= segment.len() as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "byte at offset {} not found for segment at {}",
+                        offset, index
+                    )
+                    .as_str(),
+                ));
+            }
+            remaining_len = segment.readv(index, remaining_len, &mut out);
+            // read the next segment, or move onto the active segment
+            index += 1;
+            // start from beginning of next segment
+            offset = 0;
+        }
+
+        if remaining_len == 0 {
+            return Ok((out, remaining_len, index, offset));
+        }
+
+        if offset > self.active_segment.len() as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "byte at offset {} not found for segment at {}",
+                    offset, index
+                )
+                .as_str(),
+            ));
+        }
+
+        if remaining_len == 0 {
+            return Ok((out, remaining_len, index, offset));
+        }
+
+        remaining_len = self.active_segment.readv(offset, remaining_len, &mut out);
+
+        Ok((out, remaining_len, index, offset))
     }
 }
 

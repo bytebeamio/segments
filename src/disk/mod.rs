@@ -42,8 +42,6 @@ pub enum InvalidType {
 
 //TODO: Review all unwraps
 impl DiskHandler {
-    /// Create a new disk handler which saves files in the given directory.
-    /// REVIEW: Documentation specifying return of inmemory head
     pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
         struct FileStatus {
             index_found: bool,
@@ -162,6 +160,18 @@ impl DiskHandler {
         ))
     }
 
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn head_idx(&self) -> u64 {
+        self.head
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn tail_idx(&self) -> u64 {
+        self.tail
+    }
+
     /// Returns the total number of segments.
     #[inline]
     pub(super) fn len(&self) -> u64 {
@@ -196,13 +206,13 @@ impl DiskHandler {
     /// and the index of next segment if exists.
     #[inline]
     pub(super) fn readv(
-        &mut self,
+        &self,
         index: u64,
         offset: u64,
         len: u64,
         out: &mut Vec<Bytes>,
     ) -> io::Result<(u64, Option<u64>)> {
-        let chunk = if let Some(disk_segment) = self.chunks.get_mut(&index) {
+        let chunk = if let Some(disk_segment) = self.chunks.get(&index) {
             disk_segment
         } else {
             return Err(io::Error::new(
@@ -212,8 +222,6 @@ impl DiskHandler {
         };
         let mut left = chunk.readv(offset, len, out)?;
 
-        // REVIEW: Use segments hashmap instead of binary_search
-        // as we find segment at `index` in self.chunks, it must exist in self.indices
         let mut segment_idx = index;
 
         if left == 0 {
@@ -243,7 +251,7 @@ impl DiskHandler {
             // unwrap fine as we already validated the index in the while loop
             left = self
                 .chunks
-                .get_mut(&segment_idx)
+                .get(&segment_idx)
                 .unwrap()
                 .readv(0, left, out)?;
         }
@@ -339,7 +347,7 @@ mod test {
 
         drop(handler);
 
-        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (_, handler) = DiskHandler::new(dir.path()).unwrap();
         for i in 0..20 {
             let mut v = Vec::new();
             handler
