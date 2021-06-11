@@ -5,6 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use fnv::FnvHashMap;
+use sha2::{Digest, Sha256};
 
 mod chunk;
 mod index;
@@ -25,6 +26,8 @@ pub(super) struct DiskHandler {
     tail: u64,
     /// Invalid files.
     invalid_files: Vec<InvalidType>,
+    /// The hasher for segment files
+    hasher: Sha256,
 }
 
 // TODO: document this, also also the hierarchy or InvalidType.
@@ -54,6 +57,7 @@ impl DiskHandler {
         let mut indices = Vec::new();
         let mut statuses: FnvHashMap<u64, FileStatus> = FnvHashMap::default();
         let mut invalid_files = Vec::new();
+        let mut hasher = Sha256::new();
 
         // checking status of files in dir, storing valid index in `indices`
         for file in files {
@@ -136,7 +140,12 @@ impl DiskHandler {
             } else if !segment_found {
                 invalid_files.push(InvalidType::NoSegment(index));
             } else {
-                chunks.insert(index, Chunk::new(&dir, index)?);
+                let chunk = Chunk::open(&dir, index)?;
+                if !chunk.verify(&mut hasher)? {
+                    invalid_files.push(InvalidType::InvalidChecksum(index))
+                } else {
+                    chunks.insert(index, chunk);
+                }
             }
         }
 
@@ -148,6 +157,7 @@ impl DiskHandler {
                 head,
                 tail,
                 invalid_files,
+                hasher,
             },
         ))
     }
@@ -252,38 +262,15 @@ impl DiskHandler {
     /// Store a vector of bytes to the disk. Returns offset at which bytes were appended to the
     /// segment at the given index.
     #[inline]
-    pub(super) fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<u64> {
-        let mut chunk = Chunk::new(&self.dir, index)?;
-        let res = chunk.appendv(data)?;
+    pub(super) fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<()> {
+        let chunk = Chunk::new(&self.dir, index, data, &mut self.hasher)?;
         self.chunks.insert(index, chunk);
 
         if index > self.tail {
             self.tail = index;
         }
 
-        Ok(res)
-    }
-
-    /// Flush all the segments files.
-    pub(super) fn flush(&mut self) -> io::Result<()> {
-        for chunk in self.chunks.values_mut() {
-            chunk.flush()?;
-        }
         Ok(())
-    }
-
-    /// Flush the segment file at the given index.
-    #[inline]
-    pub(super) fn flush_at(&mut self, index: u64) -> io::Result<()> {
-        self.chunks
-            .get_mut(&index)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("flushing at invalid index {}", index).as_str(),
-                )
-            })?
-            .flush()
     }
 }
 
@@ -316,8 +303,6 @@ mod test {
             }
             handler.insert(i as u64, v).unwrap();
         }
-
-        handler.flush().unwrap();
 
         for i in 0..20 {
             let mut v = Vec::new();
@@ -387,8 +372,6 @@ mod test {
             }
             handler.insert(i as u64, v).unwrap();
         }
-
-        handler.flush().unwrap();
 
         let mut v = Vec::new();
         let (mut left, mut ret) = handler.readv(0, 0, 10, &mut v).unwrap();

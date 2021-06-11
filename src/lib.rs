@@ -104,25 +104,6 @@ impl CommitLog {
         Ok((self.tail, self.active_segment.len() as u64))
     }
 
-    /// Flush the contents onto the disk. Call this before any reads if disk was opened for logs to
-    /// avoid missing data.
-    #[inline]
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.disk_handler
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
-            .flush()
-    }
-
-    /// Flush the contents onto the disk for a particular segment.
-    #[inline]
-    pub fn flush_at(&mut self, index: u64) -> io::Result<()> {
-        self.disk_handler
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
-            .flush_at(index)
-    }
-
     fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
             if self.segments.len() as u64 >= self.max_segments {
@@ -466,8 +447,6 @@ mod test {
                 log.append(byte).unwrap();
             }
         }
-
-        log.disk_handler.as_mut().unwrap().flush().unwrap();
 
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 10);
         assert_eq!(log.segments.len(), 5);

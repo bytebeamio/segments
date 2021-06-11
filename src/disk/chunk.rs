@@ -1,6 +1,7 @@
 use std::{io, path::Path};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use sha2::Digest;
 
 use super::{index::Index, segment::Segment};
 
@@ -16,7 +17,7 @@ pub(super) struct Chunk {
 impl Chunk {
     /// Create a new segment on the disk.
     #[inline]
-    pub(super) fn new<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
+    pub(super) fn open<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
         let index_path = dir.as_ref().join(&format!("{:020}.index", index));
         let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
 
@@ -25,16 +26,60 @@ impl Chunk {
         // SAFETY: We are the ones to write to both segment as well as index files, and assume no
         // external interference.
         //
-        // TODO: maybe we should verify?
-        let index = Index::new(index_path)?;
-        let segment = Segment::new(segment_path)?;
+        // TODO: verify using SHA256
+        let index = Index::open(index_path)?;
+        let segment = Segment::open(segment_path)?;
 
         Ok(Self { index, segment })
     }
 
+    pub(super) fn new<P: AsRef<Path>>(
+        dir: P,
+        index: u64,
+        bytes: Vec<Bytes>,
+        hasher: &mut impl Digest,
+    ) -> io::Result<Self> {
+        let index_path = dir.as_ref().join(&format!("{:020}.index", index));
+        let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
+
+        let mut lens = Vec::with_capacity(bytes.len());
+        for byte in &bytes {
+            lens.push(byte.len() as u64);
+        }
+
+        let bytes: Vec<u8> = bytes.into_iter().flatten().collect();
+        let bytes = Bytes::from(bytes);
+        hasher.update(&bytes);
+        let hash = hasher.finalize_reset();
+
+        let segment = Segment::new(segment_path, bytes)?;
+        // SAFETY: the length is already this, but AsRef for this length not implemented.
+        let index = Index::new(index_path, hash.as_ref(), lens)?;
+
+        Ok(Self { index, segment })
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(super) fn segment_size(&self) -> u64 {
+        self.segment.size()
+    }
+
+    pub(super) fn verify(&self, hasher: &mut impl Digest) -> io::Result<bool> {
+        let read_hash = self.index.read_hash()?;
+        let read_segment = self.segment.read(0, self.segment.size())?;
+        hasher.update(&read_segment);
+        let calculated_hash = hasher.finalize_reset();
+        Ok(calculated_hash.len() == read_hash.len()
+            && read_hash
+                .iter()
+                .enumerate()
+                .all(|(i, x)| *x == calculated_hash[i]))
+    }
+
     /// Read a packet from the disk segment at the particular index.
     #[inline]
-    pub(super) fn read(&mut self, index: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&self, index: u64) -> io::Result<Bytes> {
         let [offset, len] = self.index.read(index)?;
         self.segment.read(offset, len)
     }
@@ -42,31 +87,10 @@ impl Chunk {
     /// Read `len` packets from disk starting at `index`. If it is not possible to read `len`, it
     /// returns the number of bytes still left to read.
     #[inline]
-    pub(super) fn readv(&mut self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
         let (offsets, left) = self.index.readv(index, len)?;
         self.segment.readv(offsets, out)?;
         Ok(left)
-    }
-
-    /// Appned a packet to the disk segment. Does not check for any size limit.
-    #[cfg(test)]
-    #[inline]
-    pub(super) fn append(&mut self, bytes: Bytes) -> io::Result<u64> {
-        self.index.append(bytes.len() as u64)?;
-        self.segment.append(bytes)
-    }
-
-    /// And multiple packets at once. Returns offset at which bytes were appended.
-    pub(super) fn appendv(&mut self, bytes: Vec<Bytes>) -> io::Result<u64> {
-        let mut total = 0;
-        for byte in bytes.iter() {
-            self.index.append(byte.len() as u64)?;
-            total += byte.len();
-        }
-        let mut buf = BytesMut::with_capacity(total);
-        let t: Vec<u8> = bytes.into_iter().flatten().collect();
-        buf.extend_from_slice(&t[..]);
-        self.segment.append(buf.freeze())
     }
 
     /// Total number of packet appended.
@@ -74,37 +98,29 @@ impl Chunk {
     pub(super) fn entries(&self) -> u64 {
         self.index.entries()
     }
-
-    /// Flush the contents to disk.
-    #[inline(always)]
-    pub(super) fn flush(&mut self) -> io::Result<()> {
-        self.segment.flush()
-    }
 }
 
 #[cfg(test)]
 mod test {
+    use bytes::Bytes;
     use pretty_assertions::assert_eq;
+    use sha2::Sha256;
     use tempfile::tempdir;
 
     use super::*;
 
     #[test]
-    fn append_and_read_chunk() {
+    fn new_and_read_chunk() {
         let dir = tempdir().unwrap();
-        let mut chunk = Chunk::new(dir.path(), 2).unwrap();
+        let mut hasher = Sha256::new();
 
-        // appending 20 x 1KB to segment. results in:
-        // - segment.size = 20KB = 20 * 1024
-        // - segment[0..1023] = 0, segment[1024..2047] = 1 and so on
-        // - index.tail = 20
-        // - index.tail[offset - 1] = 1024 * 19
-        // - index.len[offset - 1] = 1024
+        let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            chunk.append(Bytes::from(vec![i; 1024])).unwrap();
+            v.push(Bytes::from(vec![i; 1024]));
         }
 
-        chunk.flush().unwrap();
+        let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();
+        assert!(chunk.verify(&mut hasher).unwrap());
 
         for i in 0..20u8 {
             let byte = chunk.read(i as u64).unwrap();
@@ -115,23 +131,22 @@ mod test {
     }
 
     #[test]
-    fn append_and_read_chunk_after_saving_to_disk() {
+    fn open_and_read_chunk() {
         let dir = tempdir().unwrap();
-        let mut chunk = Chunk::new(dir.path(), 2).unwrap();
+        let mut hasher = Sha256::new();
 
-        // appending 20 x 1KB to segment. results in:
-        // - segment.size = 20KB = 20 * 1024
-        // - segment[0..1023] = 0, segment[1024..2047] = 1 and so on
-        // - index.tail = 20
-        // - index.tail[offset - 1] = 1024 * 19
-        // - index.len[offset - 1] = 1024
+        let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            chunk.append(Bytes::from(vec![i; 1024])).unwrap();
+            v.push(Bytes::from(vec![i; 1024]));
         }
+
+        let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();
+        assert!(chunk.verify(&mut hasher).unwrap());
 
         drop(chunk);
 
-        let mut chunk = Chunk::new(dir.path(), 2).unwrap();
+        let chunk = Chunk::open(dir.path(), 0).unwrap();
+        assert!(chunk.verify(&mut hasher).unwrap());
 
         for i in 0..20u8 {
             let byte = chunk.read(i as u64).unwrap();
