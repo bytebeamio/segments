@@ -2,7 +2,6 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     mem::{transmute, MaybeUninit},
-    os::unix::prelude::FileExt,
     path::Path,
 };
 
@@ -82,7 +81,7 @@ impl Index {
     #[inline]
     pub(super) fn read_hash(&self) -> io::Result<[u8; 32]> {
         let mut buf: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };
-        self.file.read_at(&mut buf, 0)?;
+        self.read_at(&mut buf, 0)?;
         Ok(buf)
     }
 
@@ -90,8 +89,7 @@ impl Index {
     #[inline]
     pub(super) fn read(&self, index: u64) -> io::Result<[u64; 2]> {
         let mut buf: [u8; 16] = unsafe { MaybeUninit::uninit().assume_init() };
-        self.file
-            .read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index)?;
+        self.read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index)?;
         // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
         Ok(unsafe { transmute::<[u8; 16], [u64; 2]>(buf) })
     }
@@ -118,8 +116,7 @@ impl Index {
             buf.set_len(len);
         }
 
-        self.file
-            .read_at(buf.as_mut(), HASH_SIZE + ENTRY_SIZE * index)?;
+        self.read_at(buf.as_mut(), HASH_SIZE + ENTRY_SIZE * index)?;
 
         // SAFETY: needed beacuse of transmute. As new transmuted type is of different length, we
         // need to make sure the length stored in vec also matches.
@@ -129,6 +126,38 @@ impl Index {
 
         // SAFETY: we have written to disk in exact same manner.
         Ok((unsafe { transmute::<Vec<u8>, Vec<[u64; 2]>>(buf) }, left))
+    }
+
+    #[allow(unused_mut)]
+    #[inline]
+    fn read_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::prelude::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(target_family = "windows")]
+        {
+            use std::os::windows::fs::FileExt;
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        buf = &mut buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if !buf.is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 

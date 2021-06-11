@@ -1,7 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
     io,
-    os::unix::prelude::FileExt,
     path::Path,
 };
 
@@ -40,8 +39,9 @@ impl Segment {
             .create_new(true)
             .open(path)?;
         let size = bytes.len() as u64;
-        file.write_all_at(&bytes, 0)?;
-        Ok(Self { file, size })
+        let mut ret = Self { file, size };
+        ret.write_at(&bytes, 0)?;
+        Ok(ret)
     }
 
     #[inline]
@@ -68,7 +68,7 @@ impl Segment {
         let mut bytes = BytesMut::with_capacity(len);
         // SAFETY: We fill it with the contents later on, and has already been allocated.
         unsafe { bytes.set_len(len) };
-        self.file.read_exact_at(&mut bytes, offset)?;
+        self.read_at(&mut bytes, offset)?;
 
         Ok(bytes.freeze())
     }
@@ -100,6 +100,70 @@ impl Segment {
     #[inline]
     fn actual_size(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    #[allow(unused_mut)]
+    #[inline]
+    fn read_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::prelude::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(target_family = "windows")]
+        {
+            use std::os::windows::fs::FileExt;
+            while !buf.is_empty() {
+                match self.seek_write(buf, offset) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        buf = &buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if !buf.is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to write whole buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[allow(unused_mut)]
+    #[inline]
+    fn write_at(&mut self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::prelude::FileExt;
+            self.file.write_all_at(buf, offset)
+        }
+        #[cfg(target_family = "windows")]
+        {
+            use std::os::windows::fs::FileExt;
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        buf = &mut buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if !buf.is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
