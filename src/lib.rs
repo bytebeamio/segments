@@ -38,7 +38,6 @@ pub struct CommitLog {
     segments_size: u64,
     /// A set of opened file handles to all the segments stored onto the disk. This is optional.
     disk_handler: Option<DiskHandler>,
-    // TODO: add max_index_file_size?
 }
 
 impl CommitLog {

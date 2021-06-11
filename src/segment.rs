@@ -1,7 +1,5 @@
 use bytes::Bytes;
 
-// TODO: document all this
-
 /// A struct for keeping Bytes in memory.
 #[derive(Debug)]
 pub(super) struct Segment {
