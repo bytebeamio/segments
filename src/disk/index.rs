@@ -32,7 +32,9 @@ pub(super) struct Index {
 }
 
 impl Index {
-    /// Open a new index file. Does not create a new one.
+    /// Open a new index file. Does not create a new one, and throws error if does not exist.
+    ///
+    /// Note that index file is opened immutably, after writing the given data.
     #[inline]
     pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
@@ -41,6 +43,9 @@ impl Index {
         Ok(Self { file, tail })
     }
 
+    /// Create a new index file. Throws error if does not exist.
+    ///
+    /// Note that index file is opened immutably, after writing the given data.
     pub(super) fn new<P: AsRef<Path>>(path: P, hash: &[u8], lens: Vec<u64>) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .read(true)
@@ -73,6 +78,7 @@ impl Index {
         self.tail
     }
 
+    /// Read the hash stored in the index file, which is the starting 32 bytes of the file.
     #[inline]
     pub(super) fn read_hash(&self) -> io::Result<[u8; 32]> {
         let mut buf: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };

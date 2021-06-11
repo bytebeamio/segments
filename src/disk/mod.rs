@@ -30,18 +30,29 @@ pub(super) struct DiskHandler {
     hasher: Sha256,
 }
 
-// TODO: document this, also also the hierarchy or InvalidType.
+/// Enum which specifies all sort of invalid cases that can occur when reading segment-index pair
+/// from the directory provided.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum InvalidType {
+    /// The name of the file is invalid. The file can be an index file or segment file, or maybe we
+    /// can not parse it's `file_stem` as u64.
     InvalidName(PathBuf),
+    /// There is no index for the given index, but there is a segment file.
     NoIndex(u64),
+    /// There is no segment file for the given index, but there is an index file.
     NoSegment(u64),
+    /// The hash from index file does not match that which we get after hashing the segment file.
     InvalidChecksum(u64),
 }
 
 //TODO: Review all unwraps
 impl DiskHandler {
+    /// Create a new disk handler. Reads the given directory for previously existing index-segment
+    /// pairs, and stores all the invalid files (see [`crate::disk::InvalidType`]) in a vector
+    /// which can be retrieved via [`DiskHandler::invalid_files`]. It also returns the index at
+    /// which the next segment should be inserted onto the disk, which also corresponds to index at
+    /// which segments should start from in the memory.
     pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
         struct FileStatus {
             index_found: bool,
@@ -57,7 +68,6 @@ impl DiskHandler {
         let mut invalid_files = Vec::new();
         let mut hasher = Sha256::new();
 
-        // checking status of files in dir, storing valid index in `indices`
         for file in files {
             let path = file?.path();
 
@@ -82,7 +92,6 @@ impl DiskHandler {
             match path.extension().map(|s| s.to_str().unwrap()) {
                 Some("index") => {
                     if let Some(status) = statuses.get_mut(&offset) {
-                        // TODO: also verify checksum here
                         status.index_found = true;
                     } else {
                         statuses.insert(
@@ -96,7 +105,6 @@ impl DiskHandler {
                 }
                 Some("segment") => {
                     if let Some(status) = statuses.get_mut(&offset) {
-                        // TODO: also verify checksum here
                         status.segment_found = true;
                     } else {
                         statuses.insert(
@@ -160,15 +168,17 @@ impl DiskHandler {
         ))
     }
 
+    /// Get the index of segment-index pair on the disk with lowest index.
     #[allow(dead_code)]
     #[inline]
-    pub(super) fn head_idx(&self) -> u64 {
+    pub(super) fn head(&self) -> u64 {
         self.head
     }
 
+    /// Get the index of segment-index pair on the disk with highest index.
     #[allow(dead_code)]
     #[inline]
-    pub(super) fn tail_idx(&self) -> u64 {
+    pub(super) fn tail(&self) -> u64 {
         self.tail
     }
 
@@ -176,6 +186,13 @@ impl DiskHandler {
     #[inline]
     pub(super) fn len(&self) -> u64 {
         self.chunks.len() as u64
+    }
+
+    /// Retrieve the invalid files (see [`crate::disk::InvalidType`]).
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn invalid_files(&self) -> &Vec<InvalidType> {
+        &self.invalid_files
     }
 
     // /// Returns the number of entries for a particular segment.

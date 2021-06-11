@@ -15,24 +15,27 @@ pub(super) struct Chunk {
 }
 
 impl Chunk {
-    /// Create a new segment on the disk.
+    /// Opens an existing segment-index pair from the disk. Will throw error if either does not
+    /// exist. Note that this does not verify the checksum. Call [`Chunk::verify`] to do so
+    /// manually.
+    ///
+    /// This only opens them immutably.
     #[inline]
     pub(super) fn open<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
         let index_path = dir.as_ref().join(&format!("{:020}.index", index));
         let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
 
-        // PROBLEM: We don't verify whether index file's offsets make sense, for example, the max
-        // length in index file might be larger than the file, or offsets are beyond the file etc.
-        // SAFETY: We are the ones to write to both segment as well as index files, and assume no
-        // external interference.
-        //
-        // TODO: verify using SHA256
         let index = Index::open(index_path)?;
         let segment = Segment::open(segment_path)?;
 
         Ok(Self { index, segment })
     }
 
+    /// Creates a new segment-index pair onto the disk, and throws error if they already exist. The
+    /// given hasher is used to calculate the the checksum of the given bytes. The given bytes are
+    /// stored as 1 single segment.
+    ///
+    /// This only opens them immutably, after writing the given data.
     pub(super) fn new<P: AsRef<Path>>(
         dir: P,
         index: u64,
@@ -59,12 +62,15 @@ impl Chunk {
         Ok(Self { index, segment })
     }
 
-    #[inline]
+    /// Get the size of the segment.
     #[allow(dead_code)]
+    #[inline]
     pub(super) fn segment_size(&self) -> u64 {
         self.segment.size()
     }
 
+    /// Verify the checksum by reading the checksum from the start of the index file, calcuating
+    /// the checksum of segment file and then comparing those two.
     pub(super) fn verify(&self, hasher: &mut impl Digest) -> io::Result<bool> {
         let read_hash = self.index.read_hash()?;
         let read_segment = self.segment.read(0, self.segment.size())?;

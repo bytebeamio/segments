@@ -23,7 +23,7 @@ pub(super) struct Segment {
 /// It is the duty of the handler of this struct to ensure index file's size does not exceed the
 /// specified limit.
 impl Segment {
-    /// Open a new segment file.
+    /// Open a new segment file. Will throw an error if file does not exist.
     #[inline]
     pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
@@ -31,6 +31,7 @@ impl Segment {
         Ok(Self { file, size })
     }
 
+    /// Create a new segment file. Will throw an error if file already exists.
     #[inline]
     pub(super) fn new<P: AsRef<Path>>(path: P, bytes: Bytes) -> io::Result<Self> {
         let file = OpenOptions::new()
@@ -94,6 +95,7 @@ impl Segment {
         Ok(())
     }
 
+    /// Get the actual size of the file by reading it's metadata. Used only for testing.
     #[cfg(test)]
     #[inline]
     fn actual_size(&self) -> io::Result<u64> {
