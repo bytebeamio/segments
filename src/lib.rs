@@ -1,7 +1,6 @@
-use std::{io, path::PathBuf};
+use std::{collections::VecDeque, io, path::PathBuf};
 
 use bytes::Bytes;
-use fnv::FnvHashMap;
 
 mod disk;
 mod segment;
@@ -32,7 +31,7 @@ pub struct CommitLog {
     /// themselves not mutable.
     active_segment: Segment,
     /// Total size of active segment, used for enforcing the contraints.
-    segments: FnvHashMap<u64, Segment>,
+    segments: VecDeque<Segment>,
     /// Total size of segments in memory apart from active_segment, used for enforcing the
     /// contraints.
     segments_size: u64,
@@ -67,7 +66,7 @@ impl CommitLog {
                 max_segment_size,
                 max_segments,
                 active_segment: Segment::with_capacity(max_segment_size),
-                segments: FnvHashMap::default(),
+                segments: VecDeque::with_capacity(max_segments as usize),
                 segments_size: 0,
                 disk_handler: Some(files),
             });
@@ -79,7 +78,7 @@ impl CommitLog {
             max_segment_size,
             max_segments,
             active_segment: Segment::with_capacity(max_segment_size),
-            segments: FnvHashMap::default(),
+            segments: VecDeque::with_capacity(max_segments as usize),
             segments_size: 0,
             disk_handler: None,
         })
@@ -106,7 +105,8 @@ impl CommitLog {
     fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
             if self.segments.len() as u64 >= self.max_segments {
-                let removed_segment = self.segments.remove(&self.head).unwrap();
+                // TODO: unwrap might cause error if self.max_segments == 0
+                let removed_segment = self.segments.pop_front().unwrap();
                 self.segments_size -= removed_segment.size();
 
                 if let Some(files) = self.disk_handler.as_mut() {
@@ -122,7 +122,7 @@ impl CommitLog {
                 Segment::with_capacity(self.max_segment_size),
             );
             self.segments_size += old_segment.size();
-            self.segments.insert(self.tail, old_segment);
+            self.segments.push_back(old_segment);
             self.tail += 1;
         }
 
@@ -156,40 +156,12 @@ impl CommitLog {
 
         // in memory segment
         if index < self.tail {
-            if let Some(segment) = self.segments.get(&index) {
-                if index > segment.len() as u64 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        format!(
-                            "byte at offset {} not found for segment at {}",
-                            offset, index
-                        )
-                        .as_str(),
-                    ));
-                }
-
-                return Ok(segment.at(index));
-            }
-
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            let segment = &self.segments[(index - self.head) as usize];
+            return segment.at(index);
         }
 
         // in active segment
-        if index > self.active_segment.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "byte at offset {} not found for segment at {}",
-                    offset, index
-                )
-                .as_str(),
-            ));
-        }
-
-        Ok(self.active_segment.at(index))
+        self.active_segment.at(index)
     }
 
     /// Read vector of [`Bytes`] from the logs.
@@ -237,18 +209,8 @@ impl CommitLog {
         }
 
         if index < self.tail {
-            let segment = self.segments.get(&index).unwrap();
-            if offset >= segment.len() as u64 {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "byte at offset {} not found for segment at {}",
-                        offset, index
-                    )
-                    .as_str(),
-                ));
-            }
-            remaining_len = segment.readv(index, remaining_len, &mut out);
+            let segment = &self.segments[index as usize];
+            remaining_len = segment.readv(offset, remaining_len, &mut out)?;
             // read the next segment, or move onto the active segment
             index += 1;
             // start from beginning of next segment
@@ -259,22 +221,7 @@ impl CommitLog {
             return Ok((out, remaining_len, index, offset));
         }
 
-        if offset > self.active_segment.len() as u64 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "byte at offset {} not found for segment at {}",
-                    offset, index
-                )
-                .as_str(),
-            ));
-        }
-
-        if remaining_len == 0 {
-            return Ok((out, remaining_len, index, offset));
-        }
-
-        remaining_len = self.active_segment.readv(offset, remaining_len, &mut out);
+        remaining_len = self.active_segment.readv(offset, remaining_len, &mut out)?;
 
         Ok((out, remaining_len, index, offset))
     }
@@ -408,11 +355,8 @@ mod test {
 
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 7);
         assert_eq!(log.active_segment.size() as usize, len * 7);
-        assert_eq!(log.segments.get_mut(&0).unwrap().size() as usize, len * 10);
-        assert_eq!(
-            log.segments.get_mut(&0).unwrap().len() as usize,
-            ranpack_bytes.len() * 10
-        );
+        assert_eq!(log.segments[0].size() as usize, len * 10);
+        assert_eq!(log.segments[0].len() as usize, ranpack_bytes.len() * 10);
         assert_eq!(log.segments.len(), 7);
     }
 

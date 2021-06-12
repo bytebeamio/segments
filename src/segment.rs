@@ -1,3 +1,5 @@
+use std::io;
+
 use bytes::Bytes;
 
 /// A struct for keeping Bytes in memory.
@@ -26,8 +28,15 @@ impl Segment {
 
     /// Get `Bytes` at the given index.
     #[inline]
-    pub(super) fn at(&self, index: u64) -> Bytes {
-        self.data[index as usize].clone()
+    pub(super) fn at(&self, index: u64) -> io::Result<Bytes> {
+        if index > self.len() {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("byte at offset {} not found", index).as_str(),
+            ))
+        } else {
+            Ok(self.data[index as usize].clone())
+        }
     }
 
     /// Get the number of `Bytes` in the segment.
@@ -50,7 +59,14 @@ impl Segment {
 
     /// Read a range of data into `out`.
     #[inline]
-    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> u64 {
+    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+        if index >= self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("byte at offset {} not found", index).as_str(),
+            ));
+        }
+
         let mut limit = (index + len) as usize;
         let mut left = 0;
         if limit > self.data.len() {
@@ -58,6 +74,6 @@ impl Segment {
             limit = self.data.len();
         }
         out.extend_from_slice(&self.data[index as usize..limit]);
-        left as u64
+        Ok(left as u64)
     }
 }
