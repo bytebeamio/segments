@@ -134,7 +134,7 @@ impl CommitLog {
     /// #### Note
     /// `read` requires a mutable reference to self as we might need to push data to disk, which
     /// requires mutable access to corresponding file handler.
-    pub fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
+    pub fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
         if index > self.tail {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -144,7 +144,7 @@ impl CommitLog {
 
         // in disk
         if index < self.head {
-            if let Some(handler) = self.disk_handler.as_mut() {
+            if let Some(handler) = self.disk_handler.as_ref() {
                 return handler.read(index, offset);
             }
 
@@ -162,6 +162,36 @@ impl CommitLog {
 
         // in active segment
         self.active_segment.at(index)
+    }
+
+    pub fn read_with_timestamps(&self, index: u64, offset: u64) -> io::Result<(Bytes, u64)> {
+        if index > self.tail {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        // in disk
+        if index < self.head {
+            if let Some(handler) = self.disk_handler.as_ref() {
+                return handler.read_with_timestamps(index, offset);
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        // in memory segment
+        if index < self.tail {
+            let segment = &self.segments[(index - self.head) as usize];
+            return segment.at_with_timestamp(index);
+        }
+
+        // in active segment
+        self.active_segment.at_with_timestamp(index)
     }
 
     /// Read vector of [`Bytes`] from the logs.
@@ -222,6 +252,65 @@ impl CommitLog {
         }
 
         remaining_len = self.active_segment.readv(offset, remaining_len, &mut out)?;
+
+        Ok((out, remaining_len, index, offset))
+    }
+
+    pub fn readv_with_timestamps(
+        &self,
+        mut index: u64,
+        mut offset: u64,
+        len: u64,
+    ) -> io::Result<(Vec<(Bytes, u64)>, u64, u64, u64)> {
+        if index > self.tail {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("segment with given index {} not found", index).as_str(),
+            ));
+        }
+
+        let mut remaining_len = len;
+        let mut out = Vec::with_capacity(remaining_len as usize);
+
+        if index < self.head {
+            if let Some(handler) = self.disk_handler.as_ref() {
+                let (new_len, next_index) =
+                    handler.readv_with_timestamps(index, offset, remaining_len, &mut out)?;
+
+                remaining_len = new_len;
+                // start reading from memory in next iteration if no segment left to read on
+                // disk
+                index = next_index.unwrap_or(self.head);
+                // start from beginning of next segment
+                offset = 0;
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("segment with given index {} not found", index).as_str(),
+                ));
+            }
+        }
+
+        if remaining_len == 0 {
+            return Ok((out, remaining_len, index, offset));
+        }
+
+        if index < self.tail {
+            let segment = &self.segments[index as usize];
+            remaining_len = segment.readv_with_timestamps(offset, remaining_len, &mut out)?;
+            // read the next segment, or move onto the active segment
+            index += 1;
+            // start from beginning of next segment
+            offset = 0;
+        }
+
+        if remaining_len == 0 {
+            return Ok((out, remaining_len, index, offset));
+        }
+
+        remaining_len =
+            self.active_segment
+                .readv_with_timestamps(offset, remaining_len, &mut out)?;
 
         Ok((out, remaining_len, index, offset))
     }
@@ -389,7 +478,6 @@ mod test {
 
     #[test]
     fn read_from_everywhere() {
-        init_logging();
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let dir = tempdir().unwrap();
         let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();

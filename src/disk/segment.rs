@@ -95,6 +95,31 @@ impl Segment {
         Ok(())
     }
 
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        offsets: Vec<[u64; 3]>,
+        out: &mut Vec<(Bytes, u64)>,
+    ) -> io::Result<()> {
+        let total = if let Some(first) = offsets.first() {
+            let mut total = first[1];
+            for offset in offsets.iter().skip(1) {
+                total += offset[1];
+            }
+            total
+        } else {
+            return Ok(());
+        };
+
+        let mut buf = self.read(offsets[0][0], total)?;
+
+        for offset in offsets.into_iter() {
+            out.push((buf.split_to(offset[1] as usize), offset[2]));
+        }
+
+        Ok(())
+    }
+
     /// Get the actual size of the file by reading it's metadata. Used only for testing.
     #[cfg(test)]
     #[inline]

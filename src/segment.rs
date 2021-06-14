@@ -1,11 +1,14 @@
-use std::io;
+use std::{
+    io,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 
 /// A struct for keeping Bytes in memory.
 #[derive(Debug)]
 pub(super) struct Segment {
-    data: Vec<Bytes>,
+    data: Vec<(Bytes, u64)>,
     size: u64,
 }
 
@@ -23,12 +26,37 @@ impl Segment {
     #[inline]
     pub(super) fn push(&mut self, byte: Bytes) {
         self.size += byte.len() as u64;
-        self.data.push(byte);
+        self.data.push((
+            byte,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        ));
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub(super) fn push_with_timestamp(&mut self, byte: Bytes, timestamp: u64) {
+        self.size += byte.len() as u64;
+        self.data.push((byte, timestamp));
     }
 
     /// Get `Bytes` at the given index.
     #[inline]
     pub(super) fn at(&self, index: u64) -> io::Result<Bytes> {
+        if index > self.len() {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("byte at offset {} not found", index).as_str(),
+            ))
+        } else {
+            Ok(self.data[index as usize].0.clone())
+        }
+    }
+
+    #[inline]
+    pub(super) fn at_with_timestamp(&self, index: u64) -> io::Result<(Bytes, u64)> {
         if index > self.len() {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -53,13 +81,37 @@ impl Segment {
 
     /// Convert the segment into `Vec<Bytes>`, consuming `self`.
     #[inline]
-    pub(super) fn into_data(self) -> Vec<Bytes> {
+    pub(super) fn into_data(self) -> Vec<(Bytes, u64)> {
         self.data
     }
 
     /// Read a range of data into `out`.
     #[inline]
     pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+        if index >= self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("byte at offset {} not found", index).as_str(),
+            ));
+        }
+
+        let mut limit = (index + len) as usize;
+        let mut left = 0;
+        if limit > self.data.len() {
+            left = limit - self.data.len();
+            limit = self.data.len();
+        }
+        out.extend(self.data[index as usize..limit].iter().map(|x| x.0.clone()));
+        Ok(left as u64)
+    }
+
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        index: u64,
+        len: u64,
+        out: &mut Vec<(Bytes, u64)>,
+    ) -> io::Result<u64> {
         if index >= self.len() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,

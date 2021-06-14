@@ -39,18 +39,18 @@ impl Chunk {
     pub(super) fn new<P: AsRef<Path>>(
         dir: P,
         index: u64,
-        bytes: Vec<Bytes>,
+        bytes: Vec<(Bytes, u64)>,
         hasher: &mut impl Digest,
     ) -> io::Result<Self> {
         let index_path = dir.as_ref().join(&format!("{:020}.index", index));
         let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
 
         let mut lens = Vec::with_capacity(bytes.len());
-        for byte in &bytes {
-            lens.push(byte.len() as u64);
+        for (byte, timestamp) in &bytes {
+            lens.push((byte.len() as u64, *timestamp));
         }
 
-        let bytes: Vec<u8> = bytes.into_iter().flatten().collect();
+        let bytes: Vec<u8> = bytes.into_iter().map(|x| x.0).flatten().collect();
         let bytes = Bytes::from(bytes);
         hasher.update(&bytes);
         let hash = hasher.finalize_reset();
@@ -90,12 +90,36 @@ impl Chunk {
         self.segment.read(offset, len)
     }
 
+    /// Read a packet from the disk segment at the particular index.
+    #[inline]
+    pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<(Bytes, u64)> {
+        let [timestamp, offset, len] = self.index.read_with_timestamps(index)?;
+        Ok((self.segment.read(offset, len)?, timestamp))
+    }
+
     /// Read `len` packets from disk starting at `index`. If it is not possible to read `len`, it
     /// returns the number of bytes still left to read.
     #[inline]
-    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn readv(
+        &self,
+        index: u64,
+        len: u64,
+        out: &mut Vec<Bytes>,
+    ) -> io::Result<u64> {
         let (offsets, left) = self.index.readv(index, len)?;
         self.segment.readv(offsets, out)?;
+        Ok(left)
+    }
+
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        index: u64,
+        len: u64,
+        out: &mut Vec<(Bytes, u64)>,
+    ) -> io::Result<u64> {
+        let (offsets, left) = self.index.readv_with_timestamps(index, len)?;
+        self.segment.readv_with_timestamps(offsets, out)?;
         Ok(left)
     }
 
@@ -122,7 +146,7 @@ mod test {
 
         let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            v.push(Bytes::from(vec![i; 1024]));
+            v.push(( Bytes::from(vec![i; 1024]), i as u64 * 100 ));
         }
 
         let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();
@@ -143,7 +167,7 @@ mod test {
 
         let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            v.push(Bytes::from(vec![i; 1024]));
+            v.push(( Bytes::from(vec![i; 1024]), i as u64 * 100 ));
         }
 
         let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();

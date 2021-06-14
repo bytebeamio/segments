@@ -206,9 +206,25 @@ impl DiskHandler {
 
     /// Read a single packet from given offset in segment at given index.
     #[inline]
-    pub(super) fn read(&mut self, index: u64, offset: u64) -> io::Result<Bytes> {
-        if let Some(chunk) = self.chunks.get_mut(&index) {
+    pub(super) fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
+        if let Some(chunk) = self.chunks.get(&index) {
             chunk.read(offset)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ))
+        }
+    }
+
+    #[inline]
+    pub(super) fn read_with_timestamps(
+        &self,
+        index: u64,
+        offset: u64,
+    ) -> io::Result<(Bytes, u64)> {
+        if let Some(chunk) = self.chunks.get(&index) {
+            chunk.read_with_timestamps(offset)
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -266,11 +282,74 @@ impl DiskHandler {
             }
 
             // unwrap fine as we already validated the index in the while loop
+            left = self.chunks.get(&segment_idx).unwrap().readv(0, left, out)?;
+        }
+
+        Ok((0, Some(segment_idx)))
+
+        // There are three possible cases for return of Ok(_):
+        // 1.) len = 0, next = Some(_)
+        //     => we still have segment left to read, but len reached
+        // 2.) len = 0, next = None
+        //     => len reached but no more segments, we were just able to fill it
+        // 3.) len > 0, next = None
+        //     => let left, but we ran out of segments
+    }
+
+    /// Read `len` packets, starting from the given offset in segment at given index. Does not care
+    /// about segment boundaries, and will keep on reading until length is met or we run out of
+    /// packets. Returns the number of packets left to read (which can be 0), but were not found,
+    /// and the index of next segment if exists.
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        index: u64,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<(Bytes, u64)>,
+    ) -> io::Result<(u64, Option<u64>)> {
+        let chunk = if let Some(chunk) = self.chunks.get(&index) {
+            chunk
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ));
+        };
+        let mut left = chunk.readv_with_timestamps(offset, len, out)?;
+
+        let mut segment_idx = index;
+
+        if left == 0 {
+            // if no more packets left in `chunk`, move onto next
+            if offset + len >= chunk.entries() {
+                segment_idx += 1;
+                while self.chunks.get(&segment_idx).is_none() {
+                    segment_idx += 1;
+                    if segment_idx > self.tail {
+                        return Ok((left, None));
+                    }
+                }
+            }
+
+            return Ok((0, Some(segment_idx as u64)));
+        }
+
+        while left > 0 {
+            segment_idx += 1;
+            while self.chunks.get(&segment_idx).is_none() {
+                segment_idx += 1;
+                if segment_idx > self.tail {
+                    return Ok((left, None));
+                }
+            }
+
+            // unwrap fine as we already validated the index in the while loop
             left = self
                 .chunks
                 .get(&segment_idx)
                 .unwrap()
-                .readv(0, left, out)?;
+                .readv_with_timestamps(0, left, out)?;
         }
 
         Ok((0, Some(segment_idx)))
@@ -287,7 +366,7 @@ impl DiskHandler {
     /// Store a vector of bytes to the disk. Returns offset at which bytes were appended to the
     /// segment at the given index.
     #[inline]
-    pub(super) fn insert(&mut self, index: u64, data: Vec<Bytes>) -> io::Result<()> {
+    pub(super) fn insert(&mut self, index: u64, data: Vec<(Bytes, u64)>) -> io::Result<()> {
         let chunk = Chunk::new(&self.dir, index, data, &mut self.hasher)?;
         self.chunks.insert(index, chunk);
 
@@ -324,7 +403,13 @@ mod test {
         for i in 0..20 {
             let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
             for _ in 0..=i {
-                v.extend(ranpack_bytes.clone().into_iter());
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                );
             }
             handler.insert(i as u64, v).unwrap();
         }
@@ -357,7 +442,13 @@ mod test {
         for i in 0..20 {
             let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
             for _ in 0..=i {
-                v.extend(ranpack_bytes.clone().into_iter());
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                );
             }
             handler.insert(i as u64, v).unwrap();
         }
@@ -393,7 +484,13 @@ mod test {
         for i in 0..15 {
             let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
             for _ in 0..=i {
-                v.extend(ranpack_bytes.clone().into_iter());
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                );
             }
             handler.insert(i as u64, v).unwrap();
         }
