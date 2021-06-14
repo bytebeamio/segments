@@ -230,7 +230,7 @@ impl Index {
     /// Checks whether the timestamp given is contained within the smallest and the largest
     /// timestamps of the entries. Does **not** checks for exact match.
     #[inline]
-    pub(super) fn is_timestamp_contained(&self, timestamp: u64) ->bool {
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) -> bool {
         self.start_time <= timestamp && timestamp <= self.end_time
     }
 
@@ -335,6 +335,23 @@ mod test {
             assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
             assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
             assert_eq!(v[i][2], 200); // len
+        }
+    }
+
+    #[test]
+    fn test_index_from_timestamps() {
+        let dir = tempdir().unwrap();
+
+        #[rustfmt::skip]
+        let index = Index::new(
+            dir.path().join(format!("{:020}", 2).as_str()),
+            &[2; 32],
+            vec![(100,  10), (100,  20), (100,  30), (100,  40), (100,  50), (100,  60), (100,  70), (100,  80), (100,  90), (100, 100),
+                 (200, 110), (200, 120), (200, 130), (200, 140), (200, 150), (200, 160), (200, 170), (200, 180), (200, 190), (200, 200),]
+            ).unwrap();
+
+        for i in 0..20 {
+            assert_eq!(index.index_from_timestamp(i * 10 + 5).unwrap(), i);
         }
     }
 }

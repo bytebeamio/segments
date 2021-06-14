@@ -443,21 +443,30 @@ mod test {
                     ranpack_bytes
                         .clone()
                         .into_iter()
-                        .enumerate()
-                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                        .map(|x| (x, i as u64 * 100)),
                 );
             }
             handler.insert(i as u64, v).unwrap();
         }
 
         for i in 0..20 {
-            let mut v = Vec::with_capacity(handler.len() as usize);
+            let mut v = Vec::new();
             handler
                 .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
                 .unwrap();
             for _ in 0..=i {
                 let u = v.split_off(ranpack_bytes.len());
                 verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
+        }
+
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv_with_timestamps(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for elem in v {
+                assert_eq!(elem.1, i * 100);
             }
         }
     }
@@ -482,8 +491,7 @@ mod test {
                     ranpack_bytes
                         .clone()
                         .into_iter()
-                        .enumerate()
-                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                        .map(|x| (x, i as u64 * 100)),
                 );
             }
             handler.insert(i as u64, v).unwrap();
@@ -500,6 +508,16 @@ mod test {
             for _ in 0..=i {
                 let u = v.split_off(ranpack_bytes.len());
                 verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
+        }
+
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv_with_timestamps(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for elem in v {
+                assert_eq!(elem.1, i * 100);
             }
         }
     }
@@ -524,8 +542,7 @@ mod test {
                     ranpack_bytes
                         .clone()
                         .into_iter()
-                        .enumerate()
-                        .map(|(j, x)| (x, i as u64 * 100 + j as u64 * 10)),
+                        .map(|x| (x, i as u64 * 100)),
                 );
             }
             handler.insert(i as u64, v).unwrap();
@@ -546,5 +563,36 @@ mod test {
         }
 
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn read_using_timestamps() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
+
+        // results in:
+        // - ( 0, [len] *  1 packets,    0 timestamp)
+        // - ( 1, [len] *  2 packets,  100 timestamp)
+        //   ...
+        // - (14, [len] * 15 packets, 1400 timestamp)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..15 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .map(|x| (x, i as u64 * 100)),
+                );
+            }
+            handler.insert(i as u64, v).unwrap();
+        }
+
+        for i in 0..15 {
+            assert_eq!(handler.index_from_timestamp(i * 100).unwrap().0, i)
+        }
     }
 }
