@@ -269,6 +269,13 @@ impl DiskHandler {
         self.head_time
     }
 
+    #[allow(dead_code)]
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn tail_time(&self) -> u64 {
+        self.tail_time
+    }
+
     /// Read `len` packets, starting from the given offset in segment at given index. Does not care
     /// about segment boundaries, and will keep on reading until length is met or we run out of
     /// packets. Returns the number of packets left to read (which can be 0), but were not found,
@@ -404,6 +411,14 @@ impl DiskHandler {
     #[inline]
     pub(super) fn insert(&mut self, index: u64, data: Vec<(Bytes, u64)>) -> io::Result<()> {
         let chunk = Chunk::new(&self.dir, index, data, &mut self.hasher)?;
+
+        if chunk.tail_time() > self.tail_time {
+            self.tail_time = chunk.tail_time();
+        }
+        if chunk.head_time() < self.head_time {
+            self.head_time = chunk.head_time();
+        }
+
         self.chunks.insert(index, chunk);
 
         if index > self.tail {

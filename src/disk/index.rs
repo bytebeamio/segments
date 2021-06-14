@@ -128,6 +128,18 @@ impl Index {
         self.entries
     }
 
+    /// Get the timestamp of the first entry.
+    #[inline]
+    pub(super) fn head_time(&self) -> u64 {
+        self.start_time
+    }
+
+    /// Get the timestamp of the last entry.
+    #[inline]
+    pub(super) fn tail_time(&self) -> u64 {
+        self.end_time
+    }
+
     /// Read the hash stored in the index file, which is the starting 32 bytes of the file.
     #[inline]
     pub(super) fn read_hash(&self) -> io::Result<[u8; 32]> {

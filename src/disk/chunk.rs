@@ -69,6 +69,18 @@ impl Chunk {
         self.segment.size()
     }
 
+    /// Get the timestamp of the first entry.
+    #[inline]
+    pub(super) fn head_time(&self) -> u64 {
+        self.index.head_time()
+    }
+
+    /// Get the timestamp of the last entry.
+    #[inline]
+    pub(super) fn tail_time(&self) -> u64 {
+        self.index.tail_time()
+    }
+
     /// Verify the checksum by reading the checksum from the start of the index file, calcuating
     /// the checksum of segment file and then comparing those two.
     pub(super) fn verify(&self, hasher: &mut impl Digest) -> io::Result<bool> {
@@ -201,7 +213,6 @@ mod test {
 
     #[test]
     fn open_and_read_chunk() {
-        crate::test::init_logging();
         let dir = tempdir().unwrap();
         let mut hasher = Sha256::new();
 

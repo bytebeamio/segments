@@ -102,6 +102,18 @@ impl CommitLog {
         Ok((self.tail, self.active_segment.len() as u64))
     }
 
+    /// Append a new [`Bytes`] to the active segment, with timestamp as given.
+    #[inline]
+    pub fn append_with_timestamp(
+        &mut self,
+        bytes: Bytes,
+        timestamp: u64,
+    ) -> io::Result<(u64, u64)> {
+        self.apply_retention()?;
+        self.active_segment.push_with_timestamp(bytes, timestamp);
+        Ok((self.tail, self.active_segment.len() as u64))
+    }
+
     fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
             if self.segments.len() as u64 >= self.max_segments {
@@ -326,16 +338,23 @@ impl CommitLog {
 
         if self.active_segment.start_time() <= timestamp {
             // found within active segment
-            return Ok((self.tail, self.active_segment.index_from_timestamp(timestamp)));
+            return Ok((
+                self.tail,
+                self.active_segment.index_from_timestamp(timestamp),
+            ));
         }
 
-        if self.segments.len() > 0 && self.segments[0].start_time() >= timestamp {
+        if self.segments.len() > 0 && self.segments.front().unwrap().start_time() <= timestamp {
             for (i, segment) in self.segments.iter().enumerate() {
                 if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
                     // found within segment in memory
-                    return Ok((i as u64, segment.index_from_timestamp(timestamp)));
+                    return Ok((i as u64 + self.head, segment.index_from_timestamp(timestamp)));
                 }
             }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("timestamp {} not contained by any segment", timestamp).as_str(),
+            ));
         }
 
         let disk_handler = match self.disk_handler.as_ref() {
@@ -591,6 +610,41 @@ mod test {
             index = v.1;
             offset = v.2;
             verify_bytes_as_random_packets(v.0, 16);
+        }
+    }
+
+    #[test]
+    fn read_and_append_with_timestamps() {
+        let (ranpack_bytes, len) = random_packets_as_bytes();
+        let dir = tempdir().unwrap();
+        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+
+        // 160 packets in active_segment, 800 packets in segment, 640 packets in disk = total of
+        // 1600 packes.
+        // timestamps = segment_id * 1000 + offset * 10;
+        for i in 0..100 {
+            for (j, byte) in ranpack_bytes.clone().into_iter().enumerate() {
+                log.append_with_timestamp(byte, i * 1000 + j as u64 * 10)
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 10);
+        assert_eq!(log.segments.len(), 5);
+        let disk_handler = log.disk_handler.as_ref().unwrap();
+        assert_eq!(disk_handler.len(), 4);
+
+        // the segment
+        for i in 0..10 {
+            for j in 0..10 {
+                for k in 0..ranpack_bytes.len() as u64 - 1 {
+                    let idx = log
+                        .index_from_timestamp(i * 10000 + j * 1000 + k * 10 + 5)
+                        .unwrap();
+                    assert_eq!(idx.0, i);
+                    assert_eq!(idx.1, j * 16 + k + 1);
+                }
+            }
         }
     }
 }

@@ -19,15 +19,11 @@ impl Segment {
     /// Create a new segment with given capacity.
     #[inline]
     pub(super) fn with_capacity(capacity: u64) -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
         Self {
             data: Vec::with_capacity(capacity as usize),
             size: 0,
-            start_time: now,
-            end_time: now,
+            start_time: 0,
+            end_time: 0,
         }
     }
 
@@ -70,6 +66,11 @@ impl Segment {
     #[allow(dead_code)]
     #[inline]
     pub(super) fn push_with_timestamp(&mut self, byte: Bytes, timestamp: u64) {
+        // ASSUMPTION: we don't do any inserts at 1970 according to system time.
+        if self.start_time == 0 {
+            self.start_time = timestamp;
+        }
+
         self.end_time = timestamp;
         self.size += byte.len() as u64;
         self.data.push((byte, timestamp));
@@ -137,7 +138,7 @@ impl Segment {
     /// Get the largest timestamp of any packet in the segment.
     #[inline]
     pub(super) fn end_time(&self) -> u64 {
-        self.start_time
+        self.end_time
     }
 
     /// Read a range of data into `out`, doesn't add timestamp.
