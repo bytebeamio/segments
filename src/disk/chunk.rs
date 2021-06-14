@@ -21,14 +21,14 @@ impl Chunk {
     ///
     /// This only opens them immutably.
     #[inline]
-    pub(super) fn open<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<Self> {
+    pub(super) fn open<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<(Self, u64, u64)> {
         let index_path = dir.as_ref().join(&format!("{:020}.index", index));
         let segment_path = dir.as_ref().join(&format!("{:020}.segment", index));
 
-        let index = Index::open(index_path)?;
+        let (index, start_time, end_time) = Index::open(index_path)?;
         let segment = Segment::open(segment_path)?;
 
-        Ok(Self { index, segment })
+        Ok((Self { index, segment }, start_time, end_time))
     }
 
     /// Creates a new segment-index pair onto the disk, and throws error if they already exist. The
@@ -90,7 +90,8 @@ impl Chunk {
         self.segment.read(offset, len)
     }
 
-    /// Read a packet from the disk segment at the particular index.
+    /// Read a packet from the disk segment at the particular index, and also retreive it's
+    /// timestamp.
     #[inline]
     pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<(Bytes, u64)> {
         let [timestamp, offset, len] = self.index.read_with_timestamps(index)?;
@@ -100,17 +101,14 @@ impl Chunk {
     /// Read `len` packets from disk starting at `index`. If it is not possible to read `len`, it
     /// returns the number of bytes still left to read.
     #[inline]
-    pub(super) fn readv(
-        &self,
-        index: u64,
-        len: u64,
-        out: &mut Vec<Bytes>,
-    ) -> io::Result<u64> {
+    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
         let (offsets, left) = self.index.readv(index, len)?;
         self.segment.readv(offsets, out)?;
         Ok(left)
     }
 
+    /// Read `len` packets from disk starting at `index` as well as their timestamps. If it is not
+    /// possible to read `len`, it returns the number of bytes still left to read.
     #[inline]
     pub(super) fn readv_with_timestamps(
         &self,
@@ -121,6 +119,20 @@ impl Chunk {
         let (offsets, left) = self.index.readv_with_timestamps(index, len)?;
         self.segment.readv_with_timestamps(offsets, out)?;
         Ok(left)
+    }
+
+    /// Get the index that corresponds to the given timestamp, and if exact match is not found then
+    /// the entry with immediate next timestamp is returned.
+    #[inline]
+    pub(super) fn index_from_timestamp(&self, timestamp: u64) -> io::Result<u64> {
+        self.index.index_from_timestamp(timestamp)
+    }
+
+    /// Checks whether the timestamp given is contained within the smallest and the largest
+    /// timestamps of the entries. Does **not** checks for exact match.
+    #[inline]
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) -> bool {
+        self.index.is_timestamp_contained(timestamp)
     }
 
     /// Total number of packet appended.
@@ -146,7 +158,7 @@ mod test {
 
         let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            v.push(( Bytes::from(vec![i; 1024]), i as u64 * 100 ));
+            v.push((Bytes::from(vec![i; 1024]), i as u64 * 100));
         }
 
         let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();
@@ -158,16 +170,44 @@ mod test {
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
         }
+
+        for i in 0..20u8 {
+            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap();
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i);
+            assert_eq!(byte[1023], i);
+            assert_eq!(timestamp, i as u64 * 100);
+        }
+
+        let mut out = Vec::with_capacity(chunk.entries() as usize);
+        chunk.readv(0, chunk.entries(), &mut out).unwrap();
+
+        for (i, byte) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
+        }
+
+        let mut out = Vec::with_capacity(chunk.entries() as usize);
+        chunk.readv_with_timestamps(0, chunk.entries(), &mut out).unwrap();
+
+        for (i, (byte, timestamp)) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
+            assert_eq!(timestamp, i as u64 * 100);
+        }
     }
 
     #[test]
     fn open_and_read_chunk() {
+        crate::test::init_logging();
         let dir = tempdir().unwrap();
         let mut hasher = Sha256::new();
 
         let mut v = Vec::with_capacity(20);
         for i in 0..20u8 {
-            v.push(( Bytes::from(vec![i; 1024]), i as u64 * 100 ));
+            v.push((Bytes::from(vec![i; 1024]), i as u64 * 100));
         }
 
         let chunk = Chunk::new(dir.path(), 0, v, &mut hasher).unwrap();
@@ -175,7 +215,7 @@ mod test {
 
         drop(chunk);
 
-        let chunk = Chunk::open(dir.path(), 0).unwrap();
+        let (chunk, _, _) = Chunk::open(dir.path(), 0).unwrap();
         assert!(chunk.verify(&mut hasher).unwrap());
 
         for i in 0..20u8 {
@@ -183,6 +223,33 @@ mod test {
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
+        }
+
+        for i in 0..20u8 {
+            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap();
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i);
+            assert_eq!(byte[1023], i);
+            assert_eq!(timestamp, i as u64 * 100);
+        }
+
+        let mut out = Vec::with_capacity(chunk.entries() as usize);
+        chunk.readv(0, chunk.entries(), &mut out).unwrap();
+
+        for (i, byte) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
+        }
+
+        let mut out = Vec::with_capacity(chunk.entries() as usize);
+        chunk.readv_with_timestamps(0, chunk.entries(), &mut out).unwrap();
+
+        for (i, (byte, timestamp)) in out.into_iter().enumerate() {
+            assert_eq!(byte.len(), 1024);
+            assert_eq!(byte[0], i as u8);
+            assert_eq!(byte[1023], i as u8);
+            assert_eq!(timestamp, i as u64 * 100);
         }
     }
 }

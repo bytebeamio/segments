@@ -314,6 +314,95 @@ impl CommitLog {
 
         Ok((out, remaining_len, index, offset))
     }
+
+    pub fn index_from_timestamp(&self, timestamp: u64) -> io::Result<(u64, u64)> {
+        // beyond even active segment
+        if self.active_segment.end_time() < timestamp {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("timestamp {} not contained by any segment", timestamp).as_str(),
+            ));
+        }
+
+        if self.active_segment.start_time() <= timestamp {
+            // found within active segment
+            return Ok((self.tail, self.active_segment.index_from_timestamp(timestamp)));
+        }
+
+        if self.segments.len() > 0 && self.segments[0].start_time() >= timestamp {
+            for (i, segment) in self.segments.iter().enumerate() {
+                if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
+                    // found within segment in memory
+                    return Ok((i as u64, segment.index_from_timestamp(timestamp)));
+                }
+            }
+        }
+
+        let disk_handler = match self.disk_handler.as_ref() {
+            Some(disk_handler) => disk_handler,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("timestamp {} not contained by any segment", timestamp).as_str(),
+                ))
+            }
+        };
+
+        if !disk_handler.is_timestamp_contained(timestamp) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("timestamp {} not contained by any segment", timestamp).as_str(),
+            ));
+        }
+
+        disk_handler.index_from_timestamp(timestamp)
+    }
+
+    pub fn read_from_timestamp(&self, timestamp: u64) -> io::Result<(Bytes, u64)> {
+        // beyond even active segment
+        if self.active_segment.end_time() < timestamp {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("timestamp {} not contained by any segment", timestamp).as_str(),
+            ));
+        }
+
+        if self.active_segment.start_time() <= timestamp {
+            // found within active segment
+            let idx = self.active_segment.index_from_timestamp(timestamp);
+            return self.active_segment.at_with_timestamp(idx);
+        }
+
+        if self.segments.len() > 0 && self.segments[0].start_time() >= timestamp {
+            for segment in self.segments.iter() {
+                if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
+                    // found within segment in memory
+                    let idx = segment.index_from_timestamp(timestamp);
+                    return segment.at_with_timestamp(idx);
+                }
+            }
+        }
+
+        let disk_handler = match self.disk_handler.as_ref() {
+            Some(disk_handler) => disk_handler,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("timestamp {} not contained by any segment", timestamp).as_str(),
+                ))
+            }
+        };
+
+        if !disk_handler.is_timestamp_contained(timestamp) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("timestamp {} not contained by any segment", timestamp).as_str(),
+            ));
+        }
+
+        let (segment_idx, offset) = disk_handler.index_from_timestamp(timestamp)?;
+        disk_handler.read_with_timestamps(segment_idx, offset)
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +417,8 @@ mod test {
 
     use super::*;
 
+    #[allow(dead_code)]
+    #[inline]
     pub(crate) fn init_logging() {
         use simplelog::{
             ColorChoice, CombinedLogger, Config, LevelFilter, TermLogger, TerminalMode,

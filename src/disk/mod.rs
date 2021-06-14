@@ -24,6 +24,10 @@ pub(super) struct DiskHandler {
     head: u64,
     /// Ending index of segment files.
     tail: u64,
+    /// Starting timestamp of files.
+    head_time: u64,
+    /// Ending timestamp of files.
+    tail_time: u64,
     /// Invalid files.
     invalid_files: Vec<InvalidType>,
     /// The hasher for segment files
@@ -131,6 +135,9 @@ impl DiskHandler {
             (0, 0, 0)
         };
 
+        let mut start_time = 0;
+        let mut end_time = 0;
+
         // opening valid files, sorting the invalid ones
         let mut chunks = FnvHashMap::default();
         for (
@@ -146,11 +153,18 @@ impl DiskHandler {
             } else if !segment_found {
                 invalid_files.push(InvalidType::NoSegment(index));
             } else {
-                let chunk = Chunk::open(&dir, index)?;
+                let (chunk, chunk_start_time, chunk_end_time) = Chunk::open(&dir, index)?;
                 if !chunk.verify(&mut hasher)? {
                     invalid_files.push(InvalidType::InvalidChecksum(index))
                 } else {
                     chunks.insert(index, chunk);
+                }
+
+                if chunk_start_time < start_time {
+                    start_time = chunk_start_time;
+                }
+                if chunk_end_time < end_time {
+                    end_time = chunk_end_time;
                 }
             }
         }
@@ -162,6 +176,8 @@ impl DiskHandler {
                 dir: dir.as_ref().into(),
                 head,
                 tail,
+                head_time: start_time,
+                tail_time: end_time,
                 invalid_files,
                 hasher,
             },
@@ -218,11 +234,7 @@ impl DiskHandler {
     }
 
     #[inline]
-    pub(super) fn read_with_timestamps(
-        &self,
-        index: u64,
-        offset: u64,
-    ) -> io::Result<(Bytes, u64)> {
+    pub(super) fn read_with_timestamps(&self, index: u64, offset: u64) -> io::Result<(Bytes, u64)> {
         if let Some(chunk) = self.chunks.get(&index) {
             chunk.read_with_timestamps(offset)
         } else {
@@ -231,6 +243,30 @@ impl DiskHandler {
                 format!("given index {} does not exists on disk", index).as_str(),
             ))
         }
+    }
+
+    #[inline]
+    pub(super) fn index_from_timestamp(&self, timestamp: u64) -> io::Result<(u64, u64)> {
+        for (idx, chunk) in self.chunks.iter() {
+            if chunk.is_timestamp_contained(timestamp) {
+                return Ok((*idx, chunk.index_from_timestamp(timestamp)?));
+            }
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("timestamp {} not contained by any segment", timestamp).as_str(),
+        ));
+    }
+
+    #[inline]
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) -> bool {
+        self.head_time <= timestamp && timestamp <= self.tail_time
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn head_time(&self) -> u64 {
+        self.head_time
     }
 
     /// Read `len` packets, starting from the given offset in segment at given index. Does not care
@@ -415,7 +451,7 @@ mod test {
         }
 
         for i in 0..20 {
-            let mut v = Vec::new();
+            let mut v = Vec::with_capacity(handler.len() as usize);
             handler
                 .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
                 .unwrap();

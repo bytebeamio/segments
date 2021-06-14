@@ -95,6 +95,8 @@ impl Segment {
         Ok(())
     }
 
+    /// Takes in the vector of 3-arrays, whose elements are timestamp, offset, len in this order.
+    /// Returns a vector of 2-tuples containing `(packet_data, timestamp)`
     #[inline]
     pub(super) fn readv_with_timestamps(
         &self,
@@ -102,19 +104,19 @@ impl Segment {
         out: &mut Vec<(Bytes, u64)>,
     ) -> io::Result<()> {
         let total = if let Some(first) = offsets.first() {
-            let mut total = first[1];
+            let mut total = first[2];
             for offset in offsets.iter().skip(1) {
-                total += offset[1];
+                total += offset[2];
             }
             total
         } else {
             return Ok(());
         };
 
-        let mut buf = self.read(offsets[0][0], total)?;
+        let mut buf = self.read(offsets[0][1], total)?;
 
         for offset in offsets.into_iter() {
-            out.push((buf.split_to(offset[1] as usize), offset[2]));
+            out.push((buf.split_to(offset[2] as usize), offset[0]));
         }
 
         Ok(())

@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+use log::warn;
+
 /// Size of the offset of packet, in bytes.
 const OFFSET_SIZE: u64 = 8;
 /// Size of the len of packet, in bytes.
@@ -36,23 +38,45 @@ pub(super) struct Index {
     file: File,
     /// Number of entries in the index file.
     entries: u64,
+    /// The timestamp at which the index file starts.
+    start_time: u64,
+    /// The timestamp at which the index file starts.
+    end_time: u64,
 }
 
 impl Index {
-    /// Open a new index file. Does not create a new one, and throws error if does not exist.
+    /// Open a new index file. Does not create a new one, and throws error if does not exist. If
+    /// the open file does not have any entries, the timestamps will be assumed to be 0 (measured
+    /// since `UNIX_EPOCH`)
     ///
-    /// Note that index file is opened immutably, after writing the given data.
+    /// Note that index file is opened immutably.
     #[inline]
-    pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<(Self, u64, u64)> {
         let file = OpenOptions::new().read(true).open(path)?;
         let entries = (file.metadata()?.len() - HASH_SIZE) / ENTRY_SIZE;
 
-        Ok(Self { file, entries })
+        let mut index = Self {
+            file,
+            entries,
+            start_time: 0,
+            end_time: 0,
+        };
+
+        if entries == 0 {
+            warn!("empty index file opened");
+            Ok((index, 0, 0))
+        } else {
+            let [start_time, _, _] = index.read_with_timestamps(0)?;
+            let [end_time, _, _] = index.read_with_timestamps(entries - 1)?;
+            index.start_time = start_time;
+            index.end_time = end_time;
+            Ok((index, start_time, end_time))
+        }
     }
 
     /// Create a new index file. Throws error if does not exist. The `info` vector has 2-tuples as
     /// elements, whose 1st element is the length of the packet inserted in segment file, and 2nd
-    /// element is timestap in format of time since epoch. The hash may be of any len, but only
+    /// element is timestamp in format of time since epoch. The hash may be of any len, but only
     /// starting 32 bytes will be taken.
     ///
     /// Note that index file is opened immutably, after writing the given data.
@@ -68,6 +92,13 @@ impl Index {
             .open(path)?;
         let tail = info.len() as u64;
         let mut offset = 0;
+
+        let (start_time, end_time) = if let Some((_, end_time)) = info.last() {
+            (info.first().unwrap().1, *end_time)
+        } else {
+            warn!("empty index file created");
+            (0, 0)
+        };
 
         let entries: Vec<u8> = info
             .into_iter()
@@ -86,11 +117,13 @@ impl Index {
         Ok(Self {
             file,
             entries: tail,
+            start_time,
+            end_time,
         })
     }
 
-    /// Return the index at which next call to [`Index::append`] will append to.
-    #[inline(always)]
+    /// Return the number of entries in the index.
+    #[inline]
     pub(super) fn entries(&self) -> u64 {
         self.entries
     }
@@ -112,7 +145,8 @@ impl Index {
         Ok(unsafe { transmute::<[u8; 16], [u64; 2]>(buf) })
     }
 
-    /// Get the offset, size and the index of the packet at the given index.
+    /// Get the timestamp, offset and the size of the packet at the given index, found using the
+    /// index file.
     #[inline]
     pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<[u64; 3]> {
         let mut buf: [u8; 24] = unsafe { MaybeUninit::uninit().assume_init() };
@@ -120,6 +154,10 @@ impl Index {
         // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
         Ok(unsafe { transmute::<[u8; 24], [u64; 3]>(buf) })
     }
+
+    /// Get a vector of 2-arrays which have the offset and the size of the `len` packets, starting
+    /// at the `index`. If `len` is larger than number of packets stored in segment, it will return
+    /// as the 2nd element of the return tuple the number of packets still left to read.
 
     #[inline]
     pub(super) fn readv(&self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
@@ -133,9 +171,10 @@ impl Index {
         })
     }
 
-    /// Get the sizes of packets, starting from the given index upto the given length. If `len` is
-    /// larger than number of packets stored in segment, it will return as the 2nd element of the
-    /// return tuple the number of packets still left to read.
+    /// Get a vector of 3-arrays which have the timestamp, offset and size of the `len` packets,
+    /// starting at the `index`. If `len` is larger than number of packets stored in segment, it
+    /// will return as the 2nd element of the return tuple the number of packets still left to
+    /// read.
     #[inline]
     pub(super) fn readv_with_timestamps(
         &self,
@@ -169,6 +208,30 @@ impl Index {
 
         // SAFETY: we have written to disk in exact same manner.
         Ok((unsafe { transmute::<Vec<u8>, Vec<[u64; 3]>>(buf) }, left))
+    }
+
+    /// Get the index that corresponds to the given timestamp, and if exact match is not found then
+    /// the entry with immediate next timestamp is returned.
+    #[inline]
+    pub(super) fn index_from_timestamp(&self, timestamp: u64) -> io::Result<u64> {
+        let file_contents: Vec<u64> = self
+            .readv_with_timestamps(0, self.entries())?
+            .0
+            .into_iter()
+            .map(|entry| entry[0])
+            .collect();
+
+        Ok(match file_contents.binary_search(&timestamp) {
+            Ok(idx) => idx as u64,
+            Err(idx) => idx as u64,
+        })
+    }
+
+    /// Checks whether the timestamp given is contained within the smallest and the largest
+    /// timestamps of the entries. Does **not** checks for exact match.
+    #[inline]
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) ->bool {
+        self.start_time <= timestamp && timestamp <= self.end_time
     }
 
     #[allow(unused_mut)]
@@ -230,14 +293,14 @@ mod test {
 
         let (v, _) = index.readv_with_timestamps(0, 20).unwrap();
         for i in 0..10 {
-            assert_eq!(v[i][0] as usize, (i + 1));
-            assert_eq!(v[i][1] as usize, 100 * i);
-            assert_eq!(v[i][2], 100);
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 100 * i); // offset
+            assert_eq!(v[i][2], 100); // len
         }
         for i in 10..20 {
-            assert_eq!(v[i][0] as usize, (i + 1));
-            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10));
-            assert_eq!(v[i][2], 200);
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
+            assert_eq!(v[i][2], 200); // len
         }
     }
 
@@ -258,20 +321,20 @@ mod test {
 
         drop(index);
 
-        let index = Index::open(dir.path().join(format!("{:020}", 2).as_str())).unwrap();
+        let (index, _, _) = Index::open(dir.path().join(format!("{:020}", 2).as_str())).unwrap();
         assert_eq!(index.read(19).unwrap(), [2800, 200]);
         assert_eq!(index.read_hash().unwrap(), [2; 32]);
 
         let (v, _) = index.readv_with_timestamps(0, 20).unwrap();
         for i in 0..10 {
-            assert_eq!(v[i][0] as usize, (i + 1));
-            assert_eq!(v[i][1] as usize, 100 * i);
-            assert_eq!(v[i][2], 100);
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 100 * i); // offset
+            assert_eq!(v[i][2], 100); // len
         }
         for i in 10..20 {
-            assert_eq!(v[i][0] as usize, (i + 1));
-            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10));
-            assert_eq!(v[i][2], 200);
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
+            assert_eq!(v[i][2], 200); // len
         }
     }
 }
