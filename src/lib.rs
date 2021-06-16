@@ -7,6 +7,9 @@ mod segment;
 use disk::DiskHandler;
 use segment::Segment;
 
+// asdsa
+/// asdsadsa
+
 /// The log which can store commits in memory, and push them onto disk when needed, as well as read
 /// from disk any valid segment. See [`Self::new`] for more information on how exactly log is
 /// stored onto disk.
@@ -24,9 +27,9 @@ pub struct CommitLog {
     /// well as last segment in memory.
     tail: u64,
     /// Maximum size of any segment in memory.
-    max_segment_size: u64,
+    max_segment_size: usize,
     /// Maximum number of segments in memory, apart from the active segment.
-    max_segments: u64,
+    max_segments: usize,
     /// The active segment, to which incoming [`Bytes`] are appended to. Note that the bytes are
     /// themselves not mutable.
     active_segment: Segment,
@@ -34,7 +37,7 @@ pub struct CommitLog {
     segments: VecDeque<Segment>,
     /// Total size of segments in memory apart from active_segment, used for enforcing the
     /// contraints.
-    segments_size: u64,
+    segments_size: usize,
     /// A set of opened file handles to all the segments stored onto the disk. This is optional.
     disk_handler: Option<DiskHandler>,
 }
@@ -45,7 +48,7 @@ impl CommitLog {
     /// `self.head` will be removed. If a valid path is passed, the directory will be created if
     /// does not exist, and the segment at `self.head` will be stored onto disk instead of simply
     /// being deleted.
-    pub fn new(max_segment_size: u64, max_segments: u64, dir: Option<PathBuf>) -> io::Result<Self> {
+    pub fn new(max_segment_size: usize, max_segments: usize, dir: Option<PathBuf>) -> io::Result<Self> {
         if max_segment_size < 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -116,7 +119,7 @@ impl CommitLog {
 
     fn apply_retention(&mut self) -> io::Result<()> {
         if self.active_segment.size() >= self.max_segment_size {
-            if self.segments.len() as u64 >= self.max_segments {
+            if self.segments.len() >= self.max_segments {
                 // TODO: unwrap might cause error if self.max_segments == 0
                 let removed_segment = self.segments.pop_front().unwrap();
                 self.segments_size -= removed_segment.size();

@@ -9,7 +9,7 @@ use bytes::Bytes;
 #[derive(Debug)]
 pub(super) struct Segment {
     data: Vec<(Bytes, u64)>,
-    size: u64,
+    size: usize,
     start_time: u64,
     end_time: u64,
 }
@@ -18,9 +18,9 @@ pub(super) struct Segment {
 impl Segment {
     /// Create a new segment with given capacity.
     #[inline]
-    pub(super) fn with_capacity(capacity: u64) -> Self {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
-            data: Vec::with_capacity(capacity as usize),
+            data: Vec::with_capacity(capacity),
             size: 0,
             start_time: 0,
             end_time: 0,
@@ -32,7 +32,7 @@ impl Segment {
     #[allow(dead_code)]
     #[inline]
     pub(super) fn new(capacity: u64, byte: Bytes, timestamp: u64) -> Self {
-        let size = byte.len() as u64;
+        let size = byte.len();
         let mut data = Vec::with_capacity(capacity as usize);
         data.push((byte, timestamp));
 
@@ -58,7 +58,7 @@ impl Segment {
         }
 
         self.end_time = now;
-        self.size += byte.len() as u64;
+        self.size += byte.len();
         self.data.push((byte, now));
     }
 
@@ -72,7 +72,7 @@ impl Segment {
         }
 
         self.end_time = timestamp;
-        self.size += byte.len() as u64;
+        self.size += byte.len();
         self.data.push((byte, timestamp));
     }
 
@@ -119,7 +119,7 @@ impl Segment {
 
     /// Get the total size in bytes of the segment.
     #[inline]
-    pub(super) fn size(&self) -> u64 {
+    pub(super) fn size(&self) -> usize {
         self.size
     }
 
