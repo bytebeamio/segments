@@ -87,6 +87,15 @@ impl CommitLog {
         })
     }
 
+    #[inline]
+    pub fn next_offset(&self) -> (u64, u64) {
+        if self.active_segment.len() >= self.max_segment_size as u64 {
+            (self.tail + 1, 0)
+        } else {
+            (self.tail, self.active_segment.len())
+        }
+    }
+
     /// Get the number of segment on the disk.
     #[inline]
     pub fn disk_len(&self) -> io::Result<u64> {
