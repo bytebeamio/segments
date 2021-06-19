@@ -48,7 +48,11 @@ impl CommitLog {
     /// `self.head` will be removed. If a valid path is passed, the directory will be created if
     /// does not exist, and the segment at `self.head` will be stored onto disk instead of simply
     /// being deleted.
-    pub fn new(max_segment_size: usize, max_segments: usize, dir: Option<PathBuf>) -> io::Result<Self> {
+    pub fn new(
+        max_segment_size: usize,
+        max_segments: usize,
+        dir: Option<PathBuf>,
+    ) -> io::Result<Self> {
         if max_segment_size < 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -104,6 +108,17 @@ impl CommitLog {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "disk log was never opened"))?
             .len())
+    }
+
+    #[inline]
+    pub fn head_and_tail(&self) -> (u64, u64) {
+        (
+            match &self.disk_handler {
+                Some(handler) => handler.head(),
+                None => self.head,
+            },
+            self.tail,
+        )
     }
 
     /// Append a new [`Bytes`] to the active segment.
@@ -360,7 +375,10 @@ impl CommitLog {
             for (i, segment) in self.segments.iter().enumerate() {
                 if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
                     // found within segment in memory
-                    return Ok((i as u64 + self.head, segment.index_from_timestamp(timestamp)));
+                    return Ok((
+                        i as u64 + self.head,
+                        segment.index_from_timestamp(timestamp),
+                    ));
                 }
             }
             return Err(io::Error::new(
@@ -523,7 +541,7 @@ mod test {
     #[test]
     fn active_segment() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
-        let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
+        let mut log = CommitLog::new(len * 10, 10, None).unwrap();
 
         for _ in 0..5 {
             for byte in ranpack_bytes.clone() {
@@ -547,7 +565,7 @@ mod test {
     #[test]
     fn memory_segment() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
-        let mut log = CommitLog::new(len as u64 * 10, 10, None).unwrap();
+        let mut log = CommitLog::new(len * 10, 10, None).unwrap();
 
         for _ in 0..7 {
             for byte in ranpack_bytes.clone() {
@@ -575,7 +593,7 @@ mod test {
     fn disk_segment() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let dir = tempdir().unwrap();
-        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+        let mut log = CommitLog::new(len * 10, 5, Some(dir.path().into())).unwrap();
 
         for _ in 0..5 {
             for byte in ranpack_bytes.clone() {
@@ -594,7 +612,7 @@ mod test {
 
         assert_eq!(log.active_segment.size() as usize, 5 * len);
         assert_eq!(log.active_segment.len() as usize, 5 * ranpack_bytes.len());
-        assert_eq!(log.segments_size, len as u64 * 10 * 5);
+        assert_eq!(log.segments_size, len * 10 * 5);
         assert_eq!(log.disk_handler.unwrap().len(), 2);
     }
 
@@ -602,7 +620,7 @@ mod test {
     fn read_from_everywhere() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let dir = tempdir().unwrap();
-        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+        let mut log = CommitLog::new(len * 10, 5, Some(dir.path().into())).unwrap();
 
         // 160 packets in active_segment, 800 packets in segment, 640 packets in disk
         for _ in 0..100 {
@@ -614,6 +632,7 @@ mod test {
         assert_eq!(log.active_segment.len() as usize, ranpack_bytes.len() * 10);
         assert_eq!(log.segments.len(), 5);
         assert_eq!(log.disk_handler.as_ref().unwrap().len(), 4);
+        assert_eq!(log.head_and_tail(), (0, 9));
 
         let mut offset = 0;
         let mut index = 0;
@@ -629,7 +648,7 @@ mod test {
     fn read_and_append_with_timestamps() {
         let (ranpack_bytes, len) = random_packets_as_bytes();
         let dir = tempdir().unwrap();
-        let mut log = CommitLog::new(len as u64 * 10, 5, Some(dir.path().into())).unwrap();
+        let mut log = CommitLog::new(len * 10, 5, Some(dir.path().into())).unwrap();
 
         // 160 packets in active_segment, 800 packets in segment, 640 packets in disk = total of
         // 1600 packes.
