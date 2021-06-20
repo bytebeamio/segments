@@ -169,10 +169,6 @@ impl CommitLog {
     }
 
     /// Read a single [`Bytes`] from the logs.
-    ///
-    /// #### Note
-    /// `read` requires a mutable reference to self as we might need to push data to disk, which
-    /// requires mutable access to corresponding file handler.
     pub fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
         if index > self.tail {
             return Err(io::Error::new(
@@ -233,11 +229,18 @@ impl CommitLog {
         self.active_segment.at_with_timestamp(index)
     }
 
-    /// Read vector of [`Bytes`] from the logs.
+    /// Read vector of [`Bytes`] from the logs. Returns a tuple as follows:
     ///
-    /// #### Note
-    /// `readv` requires a mutable reference to self as we might need to push data to disk, which
-    /// requires mutable access to corresponding file handler.
+    /// `(data, remaining_len, index, offset)`
+    ///
+    /// - `data` is the vector of `Bytes` which were read.
+    /// - `remaining_len` is the length left from the provided length which we were not able to
+    ///   read.
+    /// - `index` is the next segment to start reading at.
+    /// - `offset` is the next offset within that segment to start reading at.
+    ///
+    /// Note that `index` and `offset` might currently not exist, and might be corresponding to
+    /// future data which will be put in log.
     pub fn readv(
         &self,
         mut index: u64,
