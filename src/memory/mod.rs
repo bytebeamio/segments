@@ -164,16 +164,23 @@ impl<T: Debug + Clone> MemoryLog<T> {
                     progress.0 += 1;
 
                     // This jump is necessary because, readv should always return data
-                    // there is data. Or else router registers this for notification even
-                    // though there is data (which might cause a block)
+                    // if there is data. Or else router registers this for notification
+                    // even though there is data (which might cause a block)
                     continue;
                 }
                 None if progress.0 == self.tail.0 => {
+                    // Same as above, we are assuming user is either asking for valid
+                    // cursor of the segment or edge cursor. If segment 1 has offsets
+                    // 10 to 19, valid cursors are (1, 10) or (1, 20), (1, 20) being
+                    // the not existent edge to jump to next segment to read from (2, 20).
+                    // User reading from invalid cursor like (1, 21) is is invalid
+                    // behavior as jump points to (2, 21)
                     progress.0 += 1;
                     break;
                 }
                 None => {
-                    // If we are jumping to new segment reset offset to start of the segment
+                    // Same as above, we are assuming user is either asking for valid
+                    // cursor of the segment or edge cursor.
                     progress.0 += 1;
                     continue;
                 }
@@ -432,7 +439,7 @@ mod test {
     }
 
     #[test]
-    fn vectored_read_to_end() {
+    fn vectored_read_iterate_through_all_the_segments() {
         let mut log = MemoryLog::new(10 * 1024, 100);
 
         for i in 0..100 {
