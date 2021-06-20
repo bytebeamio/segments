@@ -120,14 +120,19 @@ impl<T: Debug + Clone> MemoryLog<T> {
     pub fn readv(&mut self, cursor: (u64, u64), out: &mut Vec<T>) -> Option<(u64, u64)> {
         let mut progress = cursor;
 
-        // TODO Fix usize to u64 conversions
         // jump to head if the caller is trying to read deleted segment
         if progress.0 < self.head.0 {
             warn!("Trying to read a deleted segment. Jumping");
             progress = self.head;
         }
 
-        // TODO Cover case where progress.0 is > self.tail.0
+        // Return if user is trying read outside the tail.
+        if progress.0 > self.tail.0 {
+            warn!("Trying to read outside tail");
+            return None;
+        }
+
+        println!("{:?}", progress);
 
         // read from active segment if base offset matches active segment's base offset
         if progress.0 == self.tail.0 {
@@ -140,52 +145,51 @@ impl<T: Debug + Clone> MemoryLog<T> {
             return Some(progress);
         }
 
-        let mut reset_offset = false;
         loop {
-            // read from backlog segments
-            let segment = match self.segments.get(&progress.0) {
-                Some(s) => s,
+            println!("{:?}", progress);
+            // Read from backlog segments
+            match self.segments.get(&progress.0) {
+                Some(segment) => {
+                    let count = segment.readv(progress.1, out);
+                    if count > 0 {
+                        // We always read full segment. So we can always jump to next segment
+                        progress.0 += 1;
+                        progress.1 += count as u64;
+                        return Some(progress);
+                    }
+                    // Jump to the next segment if the above readv returns 0 elements
+                    // because of just being at the edge before next segment got added.
+                    // We are also assuming that user is not calling with random cursor.
+                    // E.g if segment 1's read (1, 10) returns (1, 20) as next offset,
+                    // (1, 19) being the edge of segment 1, we are assuming next segment
+                    // starts at (2, 20). If user asks for (1, 100) for random reasons,
+                    // we are screwed
+                    progress.0 += 1;
+
+                    // This jump is necessary because, readv should always return data
+                    // there is data. Or else router registers this for notification even
+                    // though there is data (which might cause a block)
+                    continue;
+                }
                 None if progress.0 == self.tail.0 => {
-                    // If we are jumping to active segment reset offset to start of the segment
-                    reset_offset = true;
-                    &self.active_segment
+                    progress.0 += 1;
+                    break;
                 }
                 None => {
                     // If we are jumping to new segment reset offset to start of the segment
-                    reset_offset = true;
                     progress.0 += 1;
                     continue;
                 }
             };
-
-            if reset_offset {
-                reset_offset = false;
-                progress.1 = segment.base_offset();
-            }
-
-            let count = segment.readv(progress.1, out);
-            if count > 0 {
-                // We always read full segment. So we can always jump to next segment
-                progress.0 += 1;
-                progress.1 += count as u64;
-                return Some(progress);
-            }
-
-            // If count is zero and current segment is tail
-            if progress.0 == self.tail.0 {
-                return None;
-            }
-
-            // Jump to the next segment if the above readv return 0 element
-            // because of just being at the edge before next segment got
-            // added
-            // NOTE: This jump is necessary because, readv should always
-            // return data if there is data. Or else router registers this
-            // for notification even though there is data (which might
-            // cause a block)
-            progress.0 += 1;
-            continue;
         }
+
+        let count = self.active_segment.readv(progress.1, out);
+        if count == 0 {
+            return None;
+        }
+
+        progress.1 += count as u64;
+        return Some(progress);
     }
 }
 
@@ -428,5 +432,21 @@ mod test {
 
         let next = log.readv(next, &mut data);
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn vectored_read_to_end() {
+        let mut log = MemoryLog::new(10 * 1024, 100);
+
+        for i in 0..100 {
+            let payload = vec![i; 1024];
+            log.append(payload.len(), payload);
+        }
+
+        let mut data = Vec::new();
+        let mut cursor = (0, 0);
+        while let Some(c) = log.readv(cursor, &mut data) {
+            cursor = c;
+        }
     }
 }

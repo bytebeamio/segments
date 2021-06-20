@@ -68,6 +68,10 @@ impl<T: Debug + Clone> Segment<T> {
             return 0;
         }
 
+        if offset > self.base_offset + self.file.len() {
+            return 0;
+        }
+
         let offset = offset - self.base_offset;
         let slice = &self.file[offset as usize..];
         out.extend_from_slice(slice);
