@@ -1,263 +1,369 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use memmap::MmapMut;
-use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    mem::{transmute, MaybeUninit},
+    path::Path,
+};
 
-const POS_WIDTH: u64 = 8;
-const LEN_WIDTH: u64 = 8;
-const ENTRY_WIDTH: u64 = POS_WIDTH + LEN_WIDTH;
+use log::warn;
 
-pub struct Index {
-    base_offset: u64,
+/// Size of the offset of packet, in bytes.
+const OFFSET_SIZE: u64 = 8;
+/// Size of the len of packet, in bytes.
+const LEN_SIZE: u64 = 8;
+/// Size of timestamp appended to each entry, in bytes.
+const TIMESTAMP_SIZE: u64 = 8;
+/// Size of the hash of segment file, stored at the start of index file.
+const HASH_SIZE: u64 = 32;
+/// Size of entry, in bytes.
+const ENTRY_SIZE: u64 = TIMESTAMP_SIZE + OFFSET_SIZE + LEN_SIZE;
+
+/// Wrapper around a index file for convenient reading of bytes sizes.
+///
+/// Does **not** check any of the constraint enforced by user, or that the index being read from/
+/// written to is valid. Simply performs what asked.
+///
+///
+///### Index file format
+///
+///The index file starts with the 32-bytes hash of the segment file, followed by entries. Each
+///entry consists of 3 u64s, [ timestamp |   offset  |    len    ].
+///
+/// #### Note
+/// It is the duty of the handler of this struct to ensure index file's size does not exceed the
+/// specified limit.
+#[derive(Debug)]
+pub(super) struct Index {
+    /// The opened index file.
     file: File,
-    mmap: MmapMut,
-    pub(crate) size: u64,
-    pub(crate) max_size: u64,
+    /// Number of entries in the index file.
+    entries: u64,
+    /// The timestamp at which the index file starts.
+    start_time: u64,
+    /// The timestamp at which the index file starts.
+    end_time: u64,
 }
 
 impl Index {
-    pub fn new<P: AsRef<Path>>(
-        dir: P,
-        base_offset: u64,
-        max_size: u64,
-        active: bool,
-    ) -> io::Result<Index> {
-        let file_name = format!("{:020}.index", base_offset);
-        let file_path: PathBuf = dir.as_ref().join(file_name);
-        let verify = file_path.exists();
+    /// Open a new index file. Does not create a new one, and throws error if does not exist. If
+    /// the open file does not have any entries, the timestamps will be assumed to be 0 (measured
+    /// since `UNIX_EPOCH`)
+    ///
+    /// Note that index file is opened immutably.
+    #[inline]
+    pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<(Self, u64, u64)> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        let entries = (file.metadata()?.len() - HASH_SIZE) / ENTRY_SIZE;
 
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&file_path)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len() as u64;
-
-        // truncate and mmap the file
-        // Old segment indexes are properly closed which shrinks the size of index file form maximum size
-        // Old segment indexes are immutable and hence we freeze the size to file size.
-        // For active segments, we set the size to max to be able to append more segment information
-        if active {
-            file.set_len(max_size)?;
-        } else {
-            file.set_len(size)?;
-        }
-
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
-        let index = Index {
-            base_offset,
+        let mut index = Self {
             file,
-            mmap,
-            size,
-            max_size,
+            entries,
+            start_time: 0,
+            end_time: 0,
         };
 
-        if verify {
-            index.verify()?;
+        if entries == 0 {
+            warn!("empty index file opened");
+            Ok((index, 0, 0))
+        } else {
+            let [start_time, _, _] = index.read_with_timestamps(0)?;
+            let [end_time, _, _] = index.read_with_timestamps(entries - 1)?;
+            index.start_time = start_time;
+            index.end_time = end_time;
+            Ok((index, start_time, end_time))
         }
-
-        Ok(index)
     }
 
-    pub fn base_offset(&self) -> u64 {
-        self.base_offset
+    /// Create a new index file. Throws error if does not exist. The `info` vector has 2-tuples as
+    /// elements, whose 1st element is the length of the packet inserted in segment file, and 2nd
+    /// element is timestamp in format of time since epoch. The hash may be of any len, but only
+    /// starting 32 bytes will be taken.
+    ///
+    /// Note that index file is opened immutably, after writing the given data.
+    pub(super) fn new<P: AsRef<Path>>(
+        path: P,
+        hash: &[u8],
+        info: Vec<(u64, u64)>,
+    ) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let tail = info.len() as u64;
+        let mut offset = 0;
+
+        let (start_time, end_time) = if let Some((_, end_time)) = info.last() {
+            (info.first().unwrap().1, *end_time)
+        } else {
+            warn!("empty index file created");
+            (0, 0)
+        };
+
+        let entries: Vec<u8> = info
+            .into_iter()
+            .map(|(len, timestamp)| {
+                let ret = [timestamp, offset, len];
+                offset += len;
+                // SAFETY: we will read back from file in exact same manner. as representation will
+                // remain same, we don't need to change the length of vec either.
+                unsafe { transmute::<[u64; 3], [u8; 24]>(ret) }
+            })
+            .flatten()
+            .collect();
+        file.write_all(&hash[..32])?;
+        file.write_all(&entries[..])?;
+
+        Ok(Self {
+            file,
+            entries: tail,
+            start_time,
+            end_time,
+        })
     }
 
-    /// Number of entries
-    pub fn count(&self) -> u64 {
-        self.size / ENTRY_WIDTH
+    /// Return the number of entries in the index.
+    #[inline]
+    pub(super) fn entries(&self) -> u64 {
+        self.entries
     }
 
-    /// Index files which aren't closed will contains zeros as the mmap file wouldn't be truncated
-    /// Treating these files as corrupted will free a lot of special case code in index and segment
-    /// Facilitates easier intuition of logic & segment appends won't return wrong offset due to
-    /// incorrect size. We can just do size based segment jumps and use ? for error handling
-    fn verify(&self) -> io::Result<()> {
-        let count = self.count();
-        if count == 0 {
-            let e = format!("Index {} should contain some data", self.base_offset);
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-
-        let (position, len) = self.read(count - 1)?;
-        if position == 0 || len == 0 {
-            let e = format!(
-                "Index {} has trailing 0s. Index corrupted",
-                self.base_offset
-            );
-            return Err(io::Error::new(io::ErrorKind::InvalidData, e));
-        }
-
-        Ok(())
+    /// Get the timestamp of the first entry.
+    #[inline]
+    pub(super) fn head_time(&self) -> u64 {
+        self.start_time
     }
 
-    pub fn write(&mut self, pos: u64, len: u64) -> io::Result<()> {
-        if self.size + ENTRY_WIDTH > self.max_size {
-            return Err(io::Error::new(io::ErrorKind::Other, "Index full"));
-        }
-
-        let start = self.size as usize;
-        let end = start + POS_WIDTH as usize;
-        let mut buf = &mut self.mmap.as_mut()[start..end];
-        buf.write_u64::<BigEndian>(pos)?;
-
-        let start = end;
-        let end = start + LEN_WIDTH as usize;
-        let mut buf = &mut self.mmap.as_mut()[start..end];
-        buf.write_u64::<BigEndian>(len)?;
-
-        self.size += ENTRY_WIDTH;
-        Ok(())
+    /// Get the timestamp of the last entry.
+    #[inline]
+    pub(super) fn tail_time(&self) -> u64 {
+        self.end_time
     }
 
-    /// Reads an offset from the index and returns segment record's position and size
-    pub fn read(&self, offset: u64) -> io::Result<(u64, u64)> {
-        if self.size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "No entries in index",
-            ));
-        }
-
-        // entry of the target offset
-        let entry_position = offset * ENTRY_WIDTH;
-
-        // reading at invalid postion from a file is implementation dependent. handle this explicitly
-        // https://doc.rust-lang.org/std/io/trait.Seek.html#tymethod.seek
-        if self.size < entry_position + ENTRY_WIDTH {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Reading at an invalid offset",
-            ));
-        }
-
-        // read position
-        let start = entry_position as usize;
-        let end = start + POS_WIDTH as usize;
-        let mut buf = &self.mmap[start..end];
-        let position = buf.read_u64::<BigEndian>()?;
-
-        // read len
-        let start = end;
-        let end = start + LEN_WIDTH as usize;
-        let mut buf = &self.mmap[start..end];
-        let len = buf.read_u64::<BigEndian>()?;
-
-        Ok((position, len))
+    /// Read the hash stored in the index file, which is the starting 32 bytes of the file.
+    #[inline]
+    pub(super) fn read_hash(&self) -> io::Result<[u8; 32]> {
+        let mut buf: [u8; 32] = unsafe { MaybeUninit::uninit().assume_init() };
+        self.read_at(&mut buf, 0)?;
+        Ok(buf)
     }
 
-    /// Returns starting position, size required to fit 'n' records, n (count)
-    /// Total size of records might cross the provided boundary. Use returned size
-    /// for allocating the buffer
-    pub fn readv(&self, offset: u64, size: u64) -> io::Result<(u64, u64, u64)> {
-        let mut count = 0;
-        let mut current_size = 0;
-        let mut next_offset = offset;
+    /// Get the offset, size of packet at the given index, using the index file.
+    #[inline]
+    pub(super) fn read(&self, index: u64) -> io::Result<[u64; 2]> {
+        let mut buf: [u8; 16] = unsafe { MaybeUninit::uninit().assume_init() };
+        self.read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index + TIMESTAMP_SIZE)?;
+        // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
+        Ok(unsafe { transmute::<[u8; 16], [u64; 2]>(buf) })
+    }
 
-        // read the first record and fail if there is a problem
-        let (pos, len) = self.read(offset)?;
-        let mut last_record_size = len;
-        let start_position = pos;
+    /// Get the timestamp, offset and the size of the packet at the given index, found using the
+    /// index file.
+    #[inline]
+    pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<[u64; 3]> {
+        let mut buf: [u8; 24] = unsafe { MaybeUninit::uninit().assume_init() };
+        self.read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index)?;
+        // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
+        Ok(unsafe { transmute::<[u8; 24], [u64; 3]>(buf) })
+    }
 
-        // all the errors here are soft failures which are just used to break the loop
-        loop {
-            // size reached. include the last record even though it crosses boundary
-            current_size += last_record_size;
-            next_offset += 1;
-            count += 1;
-            if current_size >= size {
-                break;
+    /// Get a vector of 2-arrays which have the offset and the size of the `len` packets, starting
+    /// at the `index`. If `len` is larger than number of packets stored in segment, it will return
+    /// as the 2nd element of the return tuple the number of packets still left to read.
+
+    #[inline]
+    pub(super) fn readv(&self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
+        self.readv_with_timestamps(index, len).map(|(v, left)| {
+            (
+                v.into_iter()
+                    .map(|reads| [reads[1], reads[2]])
+                    .collect::<Vec<[u64; 2]>>(),
+                left,
+            )
+        })
+    }
+
+    /// Get a vector of 3-arrays which have the timestamp, offset and size of the `len` packets,
+    /// starting at the `index`. If `len` is larger than number of packets stored in segment, it
+    /// will return as the 2nd element of the return tuple the number of packets still left to
+    /// read.
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        index: u64,
+        len: u64,
+    ) -> io::Result<(Vec<[u64; 3]>, u64)> {
+        let limit = index + len;
+        let (left, len) = if limit > self.entries {
+            (
+                limit - self.entries,
+                ((self.entries - index) * ENTRY_SIZE) as usize,
+            )
+        } else {
+            (0, (len * ENTRY_SIZE) as usize)
+        };
+
+        let mut buf = Vec::with_capacity(len);
+        // SAFETY: we have already preallocated the capacity. needed so that `read_at` fills it
+        // completely with u8.
+        unsafe {
+            buf.set_len(len);
+        }
+
+        self.read_at(buf.as_mut(), HASH_SIZE + ENTRY_SIZE * index)?;
+
+        // SAFETY: needed beacuse of transmute. As new transmuted type is of different length, we
+        // need to make sure the length stored in vec also matches.
+        unsafe {
+            buf.set_len(len / ENTRY_SIZE as usize);
+        }
+
+        // SAFETY: we have written to disk in exact same manner.
+        Ok((unsafe { transmute::<Vec<u8>, Vec<[u64; 3]>>(buf) }, left))
+    }
+
+    /// Get the index that corresponds to the given timestamp, and if exact match is not found then
+    /// the entry with immediate next timestamp is returned.
+    #[inline]
+    pub(super) fn index_from_timestamp(&self, timestamp: u64) -> io::Result<u64> {
+        let file_contents: Vec<u64> = self
+            .readv_with_timestamps(0, self.entries())?
+            .0
+            .into_iter()
+            .map(|entry| entry[0])
+            .collect();
+
+        Ok(match file_contents.binary_search(&timestamp) {
+            Ok(idx) => idx as u64,
+            Err(idx) => idx as u64,
+        })
+    }
+
+    /// Checks whether the timestamp given is contained within the smallest and the largest
+    /// timestamps of the entries. Does **not** checks for exact match.
+    #[inline]
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) -> bool {
+        self.start_time <= timestamp && timestamp <= self.end_time
+    }
+
+    #[allow(unused_mut)]
+    #[inline]
+    fn read_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::prelude::FileExt;
+            self.file.read_exact_at(buf, offset)
+        }
+        #[cfg(target_family = "windows")]
+        {
+            use std::os::windows::fs::FileExt;
+            while !buf.is_empty() {
+                match self.seek_read(buf, offset) {
+                    Ok(0) => return Ok(()),
+                    Ok(n) => {
+                        buf = &mut buf[n..];
+                        offset += n as u64;
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-
-            // estimate size till the previous record by reading current offset
-            let (_, len) = match self.read(next_offset) {
-                Ok(v) => v,
-                Err(_e) => break,
-            };
-
-            last_record_size = len;
+            if !buf.is_empty() {
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            } else {
+                Ok(())
+            }
         }
-
-        Ok((start_position, current_size, count))
-    }
-
-    pub fn close(&mut self) -> io::Result<()> {
-        self.mmap.flush()?;
-        self.file.flush()?;
-        self.file.set_len(self.size)?;
-        Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::Index;
+    use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
-    fn write_entries(index: &mut Index, entries: Vec<(u64, u64)>) {
-        for (offset, (position, len)) in entries.into_iter().enumerate() {
-            let offset = offset as u64;
-            index.write(position, len).unwrap();
-            let (p, l) = index.read(offset).unwrap();
-            assert_eq!(len, l);
-            assert_eq!(position, p);
+    use super::*;
+
+    #[test]
+    fn new_and_read_index() {
+        let dir = tempdir().unwrap();
+
+        #[rustfmt::skip]
+        let index = Index::new(
+            dir.path().join(format!("{:020}", 2).as_str()),
+            &[2; 32],
+            vec![(100,  1), (100,  2), (100,  3), (100,  4), (100,  5), (100,  6), (100,  7), (100,  8), (100,  9), (100, 10),
+                 (200, 11), (200, 12), (200, 13), (200, 14), (200, 15), (200, 16), (200, 17), (200, 18), (200, 19), (200, 20),]
+            ).unwrap();
+
+        assert_eq!(index.entries(), 20);
+        assert_eq!(index.read(9).unwrap(), [900, 100]);
+        assert_eq!(index.read(19).unwrap(), [2800, 200]);
+        assert_eq!(index.read_hash().unwrap(), [2; 32]);
+
+        let (v, _) = index.readv_with_timestamps(0, 20).unwrap();
+        for i in 0..10 {
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 100 * i); // offset
+            assert_eq!(v[i][2], 100); // len
+        }
+        for i in 10..20 {
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
+            assert_eq!(v[i][2], 200); // len
         }
     }
 
     #[test]
-    fn write_and_read_works_as_expected() {
-        let path = tempdir().unwrap();
+    fn open_and_read_index() {
+        let dir = tempdir().unwrap();
 
-        // create a new index
-        let mut index = Index::new(&path, 0, 1024, true).unwrap();
-        assert!(index.read(0).is_err());
+        #[rustfmt::skip]
+        let index = Index::new(
+            dir.path().join(format!("{:020}", 2).as_str()),
+            &[2; 32],
+            vec![(100,  1), (100,  2), (100,  3), (100,  4), (100,  5), (100,  6), (100,  7), (100,  8), (100,  9), (100, 10),
+                 (200, 11), (200, 12), (200, 13), (200, 14), (200, 15), (200, 16), (200, 17), (200, 18), (200, 19), (200, 20),]
+            ).unwrap();
 
-        let entries = vec![(0, 100), (100, 100), (200, 600), (800, 200), (1000, 100)];
+        assert_eq!(index.entries(), 20);
+        assert_eq!(index.read_hash().unwrap(), [2; 32]);
 
-        // write and read index
-        write_entries(&mut index, entries.clone());
-        assert!(index.read(5).is_err());
-        index.close().unwrap();
+        drop(index);
 
-        // try reading from an offset which is out of boundary
-        let out_of_boundary_offset = entries.len() as u64;
-        let o = index.read(out_of_boundary_offset);
-        assert!(o.is_err());
+        let (index, _, _) = Index::open(dir.path().join(format!("{:020}", 2).as_str())).unwrap();
+        assert_eq!(index.read(19).unwrap(), [2800, 200]);
+        assert_eq!(index.read_hash().unwrap(), [2; 32]);
 
-        // reconstruct the index from file
-        let index = Index::new(path, 0, 1024, true).unwrap();
-        let offset = index.count() - 1;
-        assert_eq!(offset, 4);
+        let (v, _) = index.readv_with_timestamps(0, 20).unwrap();
+        for i in 0..10 {
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 100 * i); // offset
+            assert_eq!(v[i][2], 100); // len
+        }
+        for i in 10..20 {
+            assert_eq!(v[i][0] as usize, (i + 1)); // timestamp
+            assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
+            assert_eq!(v[i][2], 200); // len
+        }
     }
 
     #[test]
-    fn bulk_reads_work_as_expected() {
-        let path = tempdir().unwrap();
+    fn test_index_from_timestamps() {
+        let dir = tempdir().unwrap();
 
-        // create a new index
-        let mut index = Index::new(&path, 0, 1024, true).unwrap();
-        assert!(index.read(0).is_err());
+        #[rustfmt::skip]
+        let index = Index::new(
+            dir.path().join(format!("{:020}", 2).as_str()),
+            &[2; 32],
+            vec![(100,  10), (100,  20), (100,  30), (100,  40), (100,  50), (100,  60), (100,  70), (100,  80), (100,  90), (100, 100),
+                 (200, 110), (200, 120), (200, 130), (200, 140), (200, 150), (200, 160), (200, 170), (200, 180), (200, 190), (200, 200),]
+            ).unwrap();
 
-        // vectors (position, size of the record)
-        let entries = vec![(0, 100), (100, 100), (200, 600), (800, 200), (1000, 100)];
-        write_entries(&mut index, entries);
-        index.close().unwrap();
-
-        let (position, size, count) = index.readv(1, 1024).unwrap();
-        assert_eq!(position, 100);
-        assert_eq!(size, 1000);
-        assert_eq!(count, 4);
-
-        let entries = vec![(0, 100), (100, 100), (200, 600), (800, 200), (1000, 100)];
-        write_entries(&mut index, entries);
-        index.close().unwrap();
-
-        // read less than size of a single record
-        let (offset, size, count) = index.readv(2, 100).unwrap();
-        assert_eq!(offset, 200);
-        assert_eq!(size, 600);
-        assert_eq!(count, 1);
+        for i in 0..20 {
+            assert_eq!(index.index_from_timestamp(i * 10 + 5).unwrap(), i);
+        }
     }
 }

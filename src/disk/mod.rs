@@ -1,565 +1,613 @@
-pub mod index;
-pub mod segment;
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
-use index::Index;
-use segment::Segment;
+use bytes::Bytes;
+use fnv::FnvHashMap;
+use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
-use std::fs;
-use std::io;
-use std::path::PathBuf;
+mod chunk;
+mod index;
+mod segment;
 
-struct Chunk {
-    index: Index,
-    segment: Segment,
-}
+use chunk::Chunk;
 
-pub struct DiskLog {
+/// A wrapper around all index and segment files on the disk.
+#[allow(dead_code)]
+pub(super) struct DiskHandler {
+    /// Hashmap for file handlers of index and segment files.
+    chunks: FnvHashMap<u64, Chunk>,
+    /// Directory in which to store files in.
     dir: PathBuf,
-    max_segment_size: u64,
-    max_index_size: u64,
-    base_offsets: Vec<u64>,
-    max_segments: usize,
-    active_chunk: u64,
-    chunks: HashMap<u64, Chunk>,
+    /// Starting index of segment files.
+    head: u64,
+    /// Ending index of segment files.
+    tail: u64,
+    /// Starting timestamp of files.
+    head_time: u64,
+    /// Ending timestamp of files.
+    tail_time: u64,
+    /// Invalid files.
+    invalid_files: Vec<InvalidType>,
+    /// The hasher for segment files
+    hasher: Sha256,
 }
 
-impl DiskLog {
-    pub fn new<P: Into<PathBuf>>(
-        dir: P,
-        max_index_size: u64,
-        max_segment_size: u64,
-        max_segments: usize,
-    ) -> io::Result<DiskLog> {
-        let dir = dir.into();
-        let _ = fs::create_dir_all(&dir);
-        if max_segment_size < 1024 || max_index_size < 100 {
-            panic!("size should be at least 1KB")
+/// Enum which specifies all sort of invalid cases that can occur when reading segment-index pair
+/// from the directory provided.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub enum InvalidType {
+    /// The name of the file is invalid. The file can be an index file or segment file, or maybe we
+    /// can not parse it's `file_stem` as u64.
+    InvalidName(PathBuf),
+    /// There is no index for the given index, but there is a segment file.
+    NoIndex(u64),
+    /// There is no segment file for the given index, but there is an index file.
+    NoSegment(u64),
+    /// The hash from index file does not match that which we get after hashing the segment file.
+    InvalidChecksum(u64),
+}
+
+//TODO: Review all unwraps
+impl DiskHandler {
+    /// Create a new disk handler. Reads the given directory for previously existing index-segment
+    /// pairs, and stores all the invalid files (see [`crate::disk::InvalidType`]) in a vector
+    /// which can be retrieved via [`DiskHandler::invalid_files`]. It also returns the index at
+    /// which the next segment should be inserted onto the disk, which also corresponds to index at
+    /// which segments should start from in the memory.
+    pub(super) fn new<P: AsRef<Path>>(dir: P) -> io::Result<(u64, Self)> {
+        struct FileStatus {
+            index_found: bool,
+            segment_found: bool,
         }
 
+        // creating and reading given dir
+        let _ = fs::create_dir_all(&dir)?;
         let files = fs::read_dir(&dir)?;
-        let mut base_offsets = Vec::new();
+
+        let mut indices = Vec::new();
+        let mut statuses: FnvHashMap<u64, FileStatus> = FnvHashMap::default();
+        let mut invalid_files = Vec::new();
+        let mut hasher = Sha256::new();
+
         for file in files {
             let path = file?.path();
-            let offset = path.file_stem().unwrap().to_str().unwrap();
-            let offset = offset.parse::<u64>().unwrap();
-            base_offsets.push(offset);
-        }
 
-        base_offsets.sort();
-        let mut chunks = HashMap::new();
-
-        let active_segment = if let Some((last_offset, offsets)) = base_offsets.split_last() {
-            // Initialized filled segments
-            for base_offset in offsets.iter() {
-                let index = Index::new(&dir, *base_offset, max_index_size, false)?;
-                let segment = Segment::new(&dir, *base_offset)?;
-                let chunk = Chunk { index, segment };
-                chunks.insert(*base_offset, chunk);
-            }
-
-            // Initialize active segment
-            let index = Index::new(&dir, *last_offset, max_index_size, true)?;
-            let segment = Segment::new(&dir, *last_offset)?;
-            let mut chunk = Chunk { index, segment };
-
-            // Wrong counts due to unclosed segments are handled during initialization. We can just assume
-            // count is always right from here on
-            let next_offset = chunk.index.count();
-            chunk.segment.set_next_offset(next_offset);
-            chunks.insert(*last_offset, chunk);
-            *last_offset
-        } else {
-            let index = Index::new(&dir, 0, max_index_size, true)?;
-            let segment = Segment::new(&dir, 0)?;
-            let chunk = Chunk { index, segment };
-            chunks.insert(0, chunk);
-            base_offsets.push(0);
-            0
-        };
-
-        let log = DiskLog {
-            dir,
-            max_segment_size,
-            max_index_size,
-            max_segments,
-            base_offsets,
-            chunks,
-            active_chunk: active_segment,
-        };
-
-        Ok(log)
-    }
-
-    pub fn append(&mut self, record: &[u8]) -> io::Result<()> {
-        let active_chunk = if let Some(v) = self.chunks.get_mut(&self.active_chunk) {
-            v
-        } else {
-            return Err(io::Error::new(io::ErrorKind::Other, "No active segment"));
-        };
-
-        if active_chunk.segment.size() >= self.max_segment_size {
-            active_chunk.segment.close()?;
-            active_chunk.index.close()?;
-
-            // update active chunk
-            let base_offset = active_chunk.index.base_offset() + active_chunk.index.count();
-            let index = Index::new(&self.dir, base_offset, self.max_index_size, true)?;
-            let segment = Segment::new(&self.dir, base_offset)?;
-            let chunk = Chunk { index, segment };
-            self.chunks.insert(base_offset, chunk);
-            self.base_offsets.push(base_offset);
-            self.active_chunk = base_offset;
-
-            if self.base_offsets.len() > self.max_segments {
-                let remove_offset = self.base_offsets.remove(0);
-                self.remove(remove_offset)?;
-            }
-        }
-
-        // write record to segment and index
-        let active_chunk = self.chunks.get_mut(&self.active_chunk).unwrap();
-        let (_, position) = active_chunk.segment.append(record)?;
-        active_chunk.index.write(position, record.len() as u64)?;
-        Ok(())
-    }
-
-    /// Read a record from correct segment
-    /// Returns data, next base offset and relative offset
-    pub fn read(&mut self, base_offset: u64, offset: u64) -> io::Result<Vec<u8>> {
-        let chunk = match self.chunks.get_mut(&base_offset) {
-            Some(segment) => segment,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Invalid segment",
-                ))
-            }
-        };
-
-        let (position, len) = chunk.index.read(offset)?;
-        let mut payload = vec![0; len as usize];
-        chunk.segment.read(position, &mut payload)?;
-        Ok(payload)
-    }
-
-    /// Goes through index and returns chunks which tell how to sweep segments to collect
-    /// necessary amount on data asked by the user
-    /// Corner cases:
-    /// When there is more data (in other segments) current eof should move to next segment
-    /// Empty segments are possible after moving to next segment
-    /// EOFs after some data is collected are not errors
-    fn indexv(&self, base_offset: u64, relative_offset: u64, size: u64) -> io::Result<Chunks> {
-        let mut chunks = Chunks {
-            base_offset,
-            relative_offset,
-            count: 0,
-            size: 0,
-            chunks: Vec::new(),
-        };
-
-        loop {
-            // Get the chunk with given base offset
-            let chunk = match self.chunks.get(&chunks.base_offset) {
-                Some(c) => c,
-                None if chunks.count == 0 => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "Invalid segment",
-                    ))
+            let file_index = match path.file_stem() {
+                // TODO: is this unwrap fine?
+                Some(s) => s.to_str().unwrap(),
+                None => {
+                    invalid_files.push(InvalidType::InvalidName(path));
+                    continue;
                 }
-                None => break,
             };
 
-            // If next relative offset is equal to index count => We've crossed the boundary
-            // NOTE: We are assuming the index file was closed properly. `index.count()` will
-            // count `unfilled zeros` due to mmap `set_len` if it was not closed properly
-            // FIXME for chunks with index which isn't closed properly, relative offset will
-            // FIXME be less than count but `readv` is going to return EOF
-            // Reads on indexes which aren't closed properly result in `EOF` when they encounter 0 length record as the mmaped
-            // segment isn't truncated. Index read goes past the actual size as the size calculation of the next boot is wrong.
-            // This block covers both usual EOFs during normal operations as well as EOFs due to unclosed index
-            // EOF due to unclosed index is a warning though
-            if chunks.relative_offset >= chunk.index.count() {
-                // break if we are already at the tail segment
-                if chunks.base_offset == *self.base_offsets.last().unwrap() {
-                    chunks.relative_offset -= 1;
-                    break;
+            let offset = match file_index.parse::<u64>() {
+                Ok(n) => n,
+                Err(_) => {
+                    invalid_files.push(InvalidType::InvalidName(path));
+                    continue;
                 }
-
-                // we use 'total offsets' to go next segment. this remains same during subsequent
-                // tail reads if there are no appends. hence the above early return
-                chunks.base_offset = chunk.index.base_offset() + chunk.index.count();
-                chunks.relative_offset = 0;
-                continue;
-            }
-
-            // Get what to read from the segment and fill the buffer. Covers the case where the logic has just moved to next
-            // segment and the segment is empty
-            let read_size = size - chunks.size;
-            let (position, payload_size, count) =
-                chunk.index.readv(chunks.relative_offset, read_size)?;
-            chunks.relative_offset += count;
-            chunks.count += count;
-            chunks.size += payload_size;
-            chunks
-                .chunks
-                .push((chunks.base_offset, position, payload_size, count));
-            if chunks.size >= size {
-                chunks.relative_offset -= 1;
-                break;
-            }
-        }
-
-        Ok(chunks)
-    }
-
-    /// Reads multiple packets from the disk and return base offset and relative offset of the
-    /// Returns base offset, relative offset of the last record along with number of messages and count
-    /// Goes to next segment when relative off set crosses boundary
-    pub fn readv(
-        &mut self,
-        base_offset: u64,
-        relative_offset: u64,
-        size: u64,
-    ) -> io::Result<(u64, u64, u64, Vec<u8>)> {
-        let chunks = self.indexv(base_offset, relative_offset, size)?;
-
-        // Fill the pre-allocated buffer
-        let mut out = vec![0; chunks.size as usize];
-        let mut start = 0;
-        for c in chunks.chunks {
-            let chunk = match self.chunks.get_mut(&c.0) {
-                Some(c) => c,
-                None => break,
             };
 
-            let position = c.1;
-            let payload_size = c.2;
-            chunk
-                .segment
-                .read(position, &mut out[start..start + payload_size as usize])?;
-            start += payload_size as usize;
+            // TODO: is this unwrap fine?
+            match path.extension().map(|s| s.to_str().unwrap()) {
+                Some("index") => {
+                    if let Some(status) = statuses.get_mut(&offset) {
+                        status.index_found = true;
+                    } else {
+                        statuses.insert(
+                            offset,
+                            FileStatus {
+                                index_found: true,
+                                segment_found: false,
+                            },
+                        );
+                    }
+                }
+                Some("segment") => {
+                    if let Some(status) = statuses.get_mut(&offset) {
+                        status.segment_found = true;
+                    } else {
+                        statuses.insert(
+                            offset,
+                            FileStatus {
+                                index_found: false,
+                                segment_found: true,
+                            },
+                        );
+                    }
+                }
+                _ => invalid_files.push(InvalidType::InvalidName(path)),
+            }
+
+            indices.push(offset);
+        }
+
+        // getting the head and tail
+        indices.sort_unstable();
+        let (inmemory_head, head, tail) = if let Some(tail) = indices.last() {
+            // unwrap fine as if last exists then first exists as well, even if they are the same
+            (*tail + 1, *indices.first().unwrap(), *tail)
+        } else {
+            (0, 0, 0)
+        };
+
+        let mut start_time = 0;
+        let mut end_time = 0;
+
+        // opening valid files, sorting the invalid ones
+        let mut chunks = FnvHashMap::default();
+        for (
+            index,
+            FileStatus {
+                index_found,
+                segment_found,
+            },
+        ) in statuses.into_iter()
+        {
+            if !index_found {
+                invalid_files.push(InvalidType::NoIndex(index));
+            } else if !segment_found {
+                invalid_files.push(InvalidType::NoSegment(index));
+            } else {
+                let (chunk, chunk_start_time, chunk_end_time) = Chunk::open(&dir, index)?;
+                if !chunk.verify(&mut hasher)? {
+                    invalid_files.push(InvalidType::InvalidChecksum(index))
+                } else {
+                    chunks.insert(index, chunk);
+                }
+
+                if chunk_start_time < start_time {
+                    start_time = chunk_start_time;
+                }
+                if chunk_end_time < end_time {
+                    end_time = chunk_end_time;
+                }
+            }
         }
 
         Ok((
-            chunks.base_offset,
-            chunks.relative_offset,
-            chunks.count,
-            out,
+            inmemory_head,
+            Self {
+                chunks,
+                dir: dir.as_ref().into(),
+                head,
+                tail,
+                head_time: start_time,
+                tail_time: end_time,
+                invalid_files,
+                hasher,
+            },
         ))
     }
 
-    pub fn close(&mut self, base_offset: u64) -> io::Result<()> {
-        if let Some(chunk) = self.chunks.get_mut(&base_offset) {
-            chunk.index.close()?;
-            chunk.segment.close()?;
+    /// Get the index of segment-index pair on the disk with lowest index.
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn head(&self) -> u64 {
+        self.head
+    }
+
+    /// Get the index of segment-index pair on the disk with highest index.
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn tail(&self) -> u64 {
+        self.tail
+    }
+
+    /// Returns the total number of segments.
+    #[inline]
+    pub(super) fn len(&self) -> u64 {
+        self.chunks.len() as u64
+    }
+
+    /// Retrieve the invalid files (see [`crate::disk::InvalidType`]).
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn invalid_files(&self) -> &Vec<InvalidType> {
+        &self.invalid_files
+    }
+
+    // /// Returns the number of entries for a particular segment.
+    // #[inline]
+    // pub(super) fn len_at(&self, index: u64) -> io::Result<u64> {
+    //     Ok(self.chunks.get(&index).ok_or(io::Error::new(
+    //             io::ErrorKind::Other,
+    //             "No elemt at the given index",
+    //         ))?.entries())
+    // }
+
+    /// Read a single packet from given offset in segment at given index.
+    #[inline]
+    pub(super) fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
+        if let Some(chunk) = self.chunks.get(&index) {
+            chunk.read(offset)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ))
+        }
+    }
+
+    #[inline]
+    pub(super) fn read_with_timestamps(&self, index: u64, offset: u64) -> io::Result<(Bytes, u64)> {
+        if let Some(chunk) = self.chunks.get(&index) {
+            chunk.read_with_timestamps(offset)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ))
+        }
+    }
+
+    #[inline]
+    pub(super) fn index_from_timestamp(&self, timestamp: u64) -> io::Result<(u64, u64)> {
+        for (idx, chunk) in self.chunks.iter() {
+            if chunk.is_timestamp_contained(timestamp) {
+                return Ok((*idx, chunk.index_from_timestamp(timestamp)?));
+            }
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("timestamp {} not contained by any segment", timestamp).as_str(),
+        ));
+    }
+
+    #[inline]
+    pub(super) fn is_timestamp_contained(&self, timestamp: u64) -> bool {
+        self.head_time <= timestamp && timestamp <= self.tail_time
+    }
+
+    #[allow(dead_code)]
+    #[inline]
+    pub(super) fn head_time(&self) -> u64 {
+        self.head_time
+    }
+
+    #[allow(dead_code)]
+    #[cfg(test)]
+    #[inline]
+    pub(super) fn tail_time(&self) -> u64 {
+        self.tail_time
+    }
+
+    /// Read `len` packets, starting from the given offset in segment at given index. Does not care
+    /// about segment boundaries, and will keep on reading until length is met or we run out of
+    /// packets. Returns the number of packets left to read (which can be 0), but were not found,
+    /// and the index of next segment if exists.
+    #[inline]
+    pub(super) fn readv(
+        &self,
+        index: u64,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<Bytes>,
+    ) -> io::Result<(u64, Option<u64>)> {
+        let chunk = if let Some(disk_segment) = self.chunks.get(&index) {
+            disk_segment
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ));
+        };
+        let mut left = chunk.readv(offset, len, out)?;
+
+        let mut segment_idx = index;
+
+        if left == 0 {
+            // if no more packets left in `chunk`, move onto next
+            if offset + len >= chunk.entries() {
+                segment_idx += 1;
+                while self.chunks.get(&segment_idx).is_none() {
+                    segment_idx += 1;
+                    if segment_idx > self.tail {
+                        return Ok((left, None));
+                    }
+                }
+            }
+
+            return Ok((0, Some(segment_idx as u64)));
+        }
+
+        while left > 0 {
+            segment_idx += 1;
+            while self.chunks.get(&segment_idx).is_none() {
+                segment_idx += 1;
+                if segment_idx > self.tail {
+                    return Ok((left, None));
+                }
+            }
+
+            // unwrap fine as we already validated the index in the while loop
+            left = self.chunks.get(&segment_idx).unwrap().readv(0, left, out)?;
+        }
+
+        Ok((0, Some(segment_idx)))
+
+        // There are three possible cases for return of Ok(_):
+        // 1.) len = 0, next = Some(_)
+        //     => we still have segment left to read, but len reached
+        // 2.) len = 0, next = None
+        //     => len reached but no more segments, we were just able to fill it
+        // 3.) len > 0, next = None
+        //     => let left, but we ran out of segments
+    }
+
+    /// Read `len` packets, starting from the given offset in segment at given index. Does not care
+    /// about segment boundaries, and will keep on reading until length is met or we run out of
+    /// packets. Returns the number of packets left to read (which can be 0), but were not found,
+    /// and the index of next segment if exists.
+    #[inline]
+    pub(super) fn readv_with_timestamps(
+        &self,
+        index: u64,
+        offset: u64,
+        len: u64,
+        out: &mut Vec<(Bytes, u64)>,
+    ) -> io::Result<(u64, Option<u64>)> {
+        let chunk = if let Some(chunk) = self.chunks.get(&index) {
+            chunk
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("given index {} does not exists on disk", index).as_str(),
+            ));
+        };
+        let mut left = chunk.readv_with_timestamps(offset, len, out)?;
+
+        let mut segment_idx = index;
+
+        if left == 0 {
+            // if no more packets left in `chunk`, move onto next
+            if offset + len >= chunk.entries() {
+                segment_idx += 1;
+                while self.chunks.get(&segment_idx).is_none() {
+                    segment_idx += 1;
+                    if segment_idx > self.tail {
+                        return Ok((left, None));
+                    }
+                }
+            }
+
+            return Ok((0, Some(segment_idx as u64)));
+        }
+
+        while left > 0 {
+            segment_idx += 1;
+            while self.chunks.get(&segment_idx).is_none() {
+                segment_idx += 1;
+                if segment_idx > self.tail {
+                    return Ok((left, None));
+                }
+            }
+
+            // unwrap fine as we already validated the index in the while loop
+            left = self
+                .chunks
+                .get(&segment_idx)
+                .unwrap()
+                .readv_with_timestamps(0, left, out)?;
+        }
+
+        Ok((0, Some(segment_idx)))
+
+        // There are three possible cases for return of Ok(_):
+        // 1.) len = 0, next = Some(_)
+        //     => we still have segment left to read, but len reached
+        // 2.) len = 0, next = None
+        //     => len reached but no more segments, we were just able to fill it
+        // 3.) len > 0, next = None
+        //     => let left, but we ran out of segments
+    }
+
+    /// Store a vector of bytes to the disk. Returns offset at which bytes were appended to the
+    /// segment at the given index.
+    #[inline]
+    pub(super) fn insert(&mut self, index: u64, data: Vec<(Bytes, u64)>) -> io::Result<()> {
+        let chunk = Chunk::new(&self.dir, index, data, &mut self.hasher)?;
+
+        if chunk.tail_time() > self.tail_time {
+            self.tail_time = chunk.tail_time();
+        }
+        if chunk.head_time() < self.head_time {
+            self.head_time = chunk.head_time();
+        }
+
+        self.chunks.insert(index, chunk);
+
+        if index > self.tail {
+            self.tail = index;
         }
 
         Ok(())
     }
-
-    // Removes segment with given base offset from the disk and the system
-    pub fn remove(&mut self, base_offset: u64) -> io::Result<()> {
-        if let Some(mut chunk) = self.chunks.remove(&base_offset) {
-            chunk.segment.close()?;
-
-            let file: PathBuf = self.dir.clone();
-            let index_file_name = format!("{:020}.index", base_offset);
-            let segment_file_name = format!("{:020}.segment", base_offset);
-
-            // dbg!(file.join(&index_file_name));
-            fs::remove_file(file.join(index_file_name))?;
-            fs::remove_file(file.join(segment_file_name))?;
-        }
-
-        Ok(())
-    }
-
-    pub fn close_all(&mut self) -> io::Result<()> {
-        for (_, chunk) in self.chunks.iter_mut() {
-            chunk.index.close()?;
-            chunk.segment.close()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn remove_all(&mut self) -> io::Result<()> {
-        self.close_all()?;
-        fs::remove_dir(&self.dir)?;
-
-        Ok(())
-    }
-}
-
-/// Captured state while sweeping indexes collect a bulk of records
-/// from segment/segments
-/// TODO: 'chunks' vector arguments aren't readable
-struct Chunks {
-    base_offset: u64,
-    relative_offset: u64,
-    count: u64,
-    size: u64,
-    chunks: Vec<(u64, u64, u64, u64)>,
 }
 
 #[cfg(test)]
 mod test {
-    use super::DiskLog;
+    use bytes::Bytes;
     use pretty_assertions::assert_eq;
-    use std::io;
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::test::{random_packets_as_bytes, verify_bytes_as_random_packets};
 
     #[test]
-    fn append_creates_and_deletes_segments_correctly() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
+    fn push_and_read_handler() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
 
-        let record_count = 100;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-        let mut payload = vec![0u8; 1024];
-
-        // 200 1K iterations. 20 files ignoring deletes. 0.segment, 10.segment .... 199.segment
-        // considering deletes -> 110.segment .. 200.segment
-        for i in 0..200 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (19, [len] * 20 packets)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..20 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .map(|x| (x, i as u64 * 100)),
+                );
+            }
+            handler.insert(i as u64, v).unwrap();
         }
 
-        // Semi fill 200.segment
-        for i in 200..205 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for _ in 0..=i {
+                let u = v.split_off(ranpack_bytes.len());
+                verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
         }
 
-        let data = log.read(10, 0);
-        match data {
-            Err(e) if e.kind() == io::ErrorKind::InvalidInput => (),
-            _ => panic!("Expecting an invalid input error"),
-        };
-
-        // read segment with base offset 110
-        let base_offset = 110;
-        for i in 0..10 {
-            let data = log.read(base_offset, i).unwrap();
-            let d = (base_offset + i) as u8;
-            assert_eq!(data[0], d);
-        }
-
-        // read segment with base offset 190
-        let base_offset = 110;
-        for i in 0..10 {
-            let data = log.read(base_offset, i).unwrap();
-            let d = (base_offset + i) as u8;
-            assert_eq!(data[0], d);
-        }
-
-        // read 200.segment which is semi filled with 5 records
-        let base_offset = 200;
-        for i in 0..5 {
-            let data = log.read(base_offset, i).unwrap();
-            let d = (base_offset + i) as u8;
-            assert_eq!(data[0], d);
-        }
-
-        let data = log.read(base_offset, 5);
-        match data {
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => (),
-            _ => panic!("Expecting end of file error"),
-        };
-    }
-
-    #[test]
-    fn multi_segment_reads_work_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
-
-        // 100K bytes
-        let record_count = 100;
-        let record_size = 1 * 1024;
-
-        // 10 records per segment. 10 segments (0.segment - 90.segment)
-        let max_segment_size = 10 * 1024;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, max_segment_size, 100).unwrap();
-
-        // 100 1K iterations. 10 files ignoring deletes.
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 90.segment (0 size)
-        // 10K per file
-        let mut payload = vec![0u8; record_size];
-        for i in 0..record_count {
-            payload[0] = i as u8;
-            log.append(&payload).unwrap();
-        }
-
-        // Read all the segments
-        let base_offset = 0;
-        for i in 0..10 {
-            let data = log.read(base_offset, i).unwrap();
-            let d = (base_offset + i) as u8;
-            assert_eq!(data[0], d);
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv_with_timestamps(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for elem in v {
+                assert_eq!(elem.1, i * 100);
+            }
         }
     }
 
     #[test]
-    fn vectored_read_works_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
+    fn push_and_read_handler_after_drop() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
 
-        let record_count = 100;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-
-        // 90 1K iterations. 10 files ignoring deletes.
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 90.segment (0 size)
-        // 10K per file
-        let mut payload = vec![0u8; 1024];
-        for i in 0..90 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (19, [len] * 20 packets)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..20 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .map(|x| (x, i as u64 * 100)),
+                );
+            }
+            handler.insert(i as u64, v).unwrap();
         }
 
-        // Read 50K. Reads 0.segment - 4.segment
-        let (base_offset, relative_offset, count, data) = log.readv(0, 0, 50 * 1024).unwrap();
-        assert_eq!(base_offset, 40);
-        assert_eq!(relative_offset, 9);
-        assert_eq!(count, 50);
+        drop(handler);
 
-        let total_size = data.len();
-        assert_eq!(total_size, 50 * 1024);
-
-        // Read 50.segment offset 0
-        let data = log.read(50, 0).unwrap();
-        assert_eq!(data[0], 50);
-    }
-
-    #[test]
-    fn vectored_reads_in_different_boots_works_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
-
-        let record_count = 100;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-
-        // 100 1K iterations. 10 files
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 90.segment (90 - 99)
-        // 10K per file
-        let mut payload: Vec<u8> = vec![0u8; 1024];
-        for i in 0..100 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        let (_, handler) = DiskHandler::new(dir.path()).unwrap();
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for _ in 0..=i {
+                let u = v.split_off(ranpack_bytes.len());
+                verify_bytes_as_random_packets(u, ranpack_bytes.len());
+            }
         }
 
-        log.close_all().unwrap();
-
-        // Boot 2. Read 50K. Reads 0.segment - 4.segment
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-        let (base_offset, relative_offset, count, data) = log.readv(0, 0, 50 * 1024).unwrap();
-        assert_eq!(base_offset, 40);
-        assert_eq!(relative_offset, 9);
-        assert_eq!(count, 50);
-
-        for i in 0..count {
-            let start = i as usize * 1024;
-            let end = start + 1024;
-            let record = &data[start..end];
-            assert_eq!(record[0], i as u8);
-        }
-
-        let total_size = data.len();
-        assert_eq!(total_size, 50 * 1024);
-
-        // Read 50.segment offset 0
-        let data = log.read(50, 0).unwrap();
-        assert_eq!(data[0], 50);
-    }
-
-    #[test]
-    fn vectored_reads_on_unclosed_index_and_segment_works_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
-
-        // 15K bytes
-        let record_count = 15;
-        let record_size = 1 * 1024;
-
-        let max_segment_size = 10 * 1024;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, max_segment_size, 100).unwrap();
-
-        // 10 records per segment. 2 segments. 0.segment, 10.segment (partially filled and unclosed)
-        let mut payload = vec![0u8; record_size];
-        for i in 0..record_count {
-            payload[0] = i as u8;
-            log.append(&payload).unwrap();
-        }
-
-        // Last disk not closed. Index will be filled with zeros and segment entries in index are not flushed from buffer yet
-        // Trailing zero indexes are considered as corrupted indexes
-        if let Ok(_l) = DiskLog::new(dir, max_index_size, max_segment_size, 100) {
-            panic!("Expecting a corrupted index error due to trailing zeros in the index")
+        for i in 0..20 {
+            let mut v = Vec::new();
+            handler
+                .readv_with_timestamps(i, 0, ranpack_bytes.len() as u64 * (i + 1), &mut v)
+                .unwrap();
+            for elem in v {
+                assert_eq!(elem.1, i * 100);
+            }
         }
     }
 
     #[test]
-    fn vectored_reads_crosses_boundary_correctly() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
+    fn read_handler_from_returned_index() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
 
-        let record_count = 100;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-
-        // 25 1K iterations. 3 segments
-        // 0.segment (10K, data with 0 - 9), 10.segment (5K, data with 10 - 14)
-        let mut payload = vec![0u8; 1024];
-        for i in 0..25 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        // results in:
+        // - ( 0, [len] *  1 packets)
+        // - ( 1, [len] *  2 packets)
+        //   ...
+        // - (14, [len] * 15 packets)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..15 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .map(|x| (x, i as u64 * 100)),
+                );
+            }
+            handler.insert(i as u64, v).unwrap();
         }
 
-        // Read 15K. Crosses boundaries of the segment and offset will be in the middle of 2nd segment
-        let (base_offset, relative_offset, count, data) = log.readv(0, 0, 15 * 1024).unwrap();
-        assert_eq!(base_offset, 10);
-        assert_eq!(relative_offset, 4);
-        assert_eq!(count, 15);
-        assert_eq!(data.len(), 15 * 1024);
+        let mut v = Vec::new();
+        let (mut left, mut ret) = handler.readv(0, 0, 10, &mut v).unwrap();
+        verify_bytes_as_random_packets(v, 10);
+        let mut offset = 0;
+        let mut v: Vec<Bytes> = Vec::new();
 
-        // Read 15K. Crosses boundaries of the segment and offset will be at last record of 3rd segment
-        let (base_offset, relative_offset, count, data) = log
-            .readv(base_offset, relative_offset + 1, 15 * 1024)
-            .unwrap();
-        assert_eq!(base_offset, 20);
-        assert_eq!(relative_offset, 4);
-        assert_eq!(count, 10);
-        assert_eq!(data.len(), 10 * 1024);
+        while let Some(seg) = ret {
+            v.clear();
+            offset = if left > 0 { 0 } else { offset + 10 };
+            let (new_left, new_ret) = handler.readv(seg, offset, 10, &mut v).unwrap();
+            left = new_left;
+            ret = new_ret;
+        }
+
+        assert_eq!(left, 0);
     }
 
     #[test]
-    fn vectored_read_more_than_full_chomp_works_as_expected() {
-        let dir = tempfile::tempdir().unwrap();
-        let dir = dir.path();
+    fn read_using_timestamps() {
+        let dir = tempdir().unwrap();
+        let (_, mut handler) = DiskHandler::new(dir.path()).unwrap();
+        let (ranpack_bytes, _) = random_packets_as_bytes();
 
-        let record_count = 100;
-        let max_index_size = record_count * 16;
-        let mut log = DiskLog::new(dir, max_index_size, 10 * 1024, 10).unwrap();
-
-        // 90 1K iterations. 10 files
-        // 0.segment (data with 0 - 9), 10.segment (10 - 19) .... 80.segment
-        // 10K per file. 90K in total
-        let mut payload = vec![0u8; 1024];
-        for i in 0..90 {
-            payload[0] = i;
-            log.append(&payload).unwrap();
+        // results in:
+        // - ( 0, [len] *  1 packets,    0 timestamp)
+        // - ( 1, [len] *  2 packets,  100 timestamp)
+        //   ...
+        // - (14, [len] * 15 packets, 1400 timestamp)
+        //
+        // where [len] = ranpack_bytes.len()
+        for i in 0..15 {
+            let mut v = Vec::with_capacity((i + 1) * ranpack_bytes.len());
+            for _ in 0..=i {
+                v.extend(
+                    ranpack_bytes
+                        .clone()
+                        .into_iter()
+                        .map(|x| (x, i as u64 * 100)),
+                );
+            }
+            handler.insert(i as u64, v).unwrap();
         }
 
-        // Read 200K. Crosses boundaries of all the segments
-        let (base_offset, relative_offset, count, data) = log.readv(0, 0, 200 * 1024).unwrap();
-        assert_eq!(base_offset, 80);
-        assert_eq!(relative_offset, 9);
-        assert_eq!(count, 90);
-        assert_eq!(data.len(), 90 * 1024);
+        for i in 0..15 {
+            assert_eq!(handler.index_from_timestamp(i * 100).unwrap().0, i)
+        }
     }
 }
