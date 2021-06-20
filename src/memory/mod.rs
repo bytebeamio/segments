@@ -149,8 +149,6 @@ impl<T: Debug + Clone> MemoryLog<T> {
                 Some(segment) => {
                     let count = segment.readv(progress.1, out);
                     if count > 0 {
-                        // We always read full segment. So we can always jump to next segment
-                        progress.0 += 1;
                         progress.1 += count as u64;
                         return Some(progress);
                     }
@@ -169,18 +167,15 @@ impl<T: Debug + Clone> MemoryLog<T> {
                     continue;
                 }
                 None if progress.0 == self.tail.0 => {
+                    break;
+                }
+                None => {
                     // Same as above, we are assuming user is either asking for valid
                     // cursor of the segment or edge cursor. If segment 1 has offsets
                     // 10 to 19, valid cursors are (1, 10) or (1, 20), (1, 20) being
                     // the not existent edge to jump to next segment to read from (2, 20).
                     // User reading from invalid cursor like (1, 21) is is invalid
                     // behavior as jump points to (2, 21)
-                    progress.0 += 1;
-                    break;
-                }
-                None => {
-                    // Same as above, we are assuming user is either asking for valid
-                    // cursor of the segment or edge cursor.
                     progress.0 += 1;
                     continue;
                 }
@@ -271,9 +266,9 @@ mod test {
 
         let mut data = Vec::new();
         // Read a segment from start. This returns full segment
-        let next = log.readv((0, 0), &mut data);
+        let next = log.readv((0, 0), &mut data).unwrap();
         assert_eq!(data.len(), 10);
-        assert_eq!(next, Some((1, 10)));
+        assert_eq!(next, (0, 10));
         assert_eq!(data[0][0], 0);
         assert_eq!(data[data.len() - 1][0], 9);
 
@@ -283,17 +278,59 @@ mod test {
 
         // Read a segment from the middle. This returns all the remaining elements
         let mut data = Vec::new();
-        let next = log.readv((1, 15), &mut data);
+        let next = log.readv((1, 15), &mut data).unwrap();
         assert_eq!(data.len(), 5);
-        assert_eq!(next, Some((2, 20)));
+        assert_eq!(next, (1, 20));
         assert_eq!(data[0][0], 15);
         assert_eq!(data[data.len() - 1][0], 19);
 
         // Read a segment from scratch. gets full segment
         let mut data = Vec::new();
-        let next = log.readv((1, 10), &mut data);
+        let next = log.readv((1, 10), &mut data).unwrap();
         assert_eq!(data.len(), 10);
-        assert_eq!(next, Some((2, 20)));
+        assert_eq!(next, (1, 20));
+    }
+
+    #[test]
+    fn vectored_read_works_as_expected_2() {
+        let mut log = MemoryLog::new(10 * 1024, 100);
+
+        // 15 1K iterations. 1.5 files
+        // 0.segment (data with 0 - 9), 1.segment (10 - 15)
+        for i in 0..15 {
+            let payload = vec![i; 1024];
+            log.append(payload.len(), payload);
+        }
+
+        let mut data = Vec::new();
+
+        // Read a segment from start. This returns full segment
+        let next = log.readv((0, 0), &mut data).unwrap();
+        assert_eq!(next, (0, 10));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (1, 15));
+
+        // Write again
+        for i in 15..50 {
+            let payload = vec![i; 1024];
+            log.append(payload.len(), payload);
+        }
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (1, 20));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (2, 30));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (3, 40));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (4, 50));
+
+        let next = log.readv(next, &mut data);
+        assert!(next.is_none());
     }
 
     #[test]
@@ -367,74 +404,32 @@ mod test {
         // read active segment. there's no next segment. so active segment
         // is not done yet
         let mut data = Vec::new();
-        let next = log.readv((8, 80), &mut data);
+        let next = log.readv((8, 80), &mut data).unwrap();
         assert_eq!(data.len(), 10);
-        assert_eq!(next, Some((8, 90)));
+        assert_eq!(next, (8, 90));
 
-        // append more which also changes active segment to 100.segment
+        // Append more which also changes active segment to 100.segment
         for i in 90..110 {
             let payload = vec![i; 1024];
             log.append(payload.len(), payload);
         }
 
-        // read from the next offset of previous active segment
+        // Read from the next offset of previous active segment
         let mut data = Vec::new();
-        let next = log.readv(next.unwrap(), &mut data);
+        let next = log.readv(next, &mut data).unwrap();
         assert_eq!(data.len(), 10);
-        assert_eq!(next, Some((10, 100)));
+        assert_eq!(next, (9, 100));
 
         // read active segment again
         let mut data = Vec::new();
-        let next = log.readv(next.unwrap(), &mut data);
+        let next = log.readv(next, &mut data).unwrap();
         assert_eq!(data.len(), 10);
-        assert_eq!(next, Some((10, 110)));
+        assert_eq!(next, (10, 110));
 
         // read again when there is no more data
         let mut data = Vec::new();
-        let next = log.readv(next.unwrap(), &mut data);
-        assert_eq!(data.len(), 0);
-        assert!(next.is_none());
-    }
-
-    #[test]
-    fn vectored_read_works_as_expected_2() {
-        let mut log = MemoryLog::new(10 * 1024, 100);
-
-        // 15 1K iterations. 1.5 files
-        // 0.segment (data with 0 - 9), 1.segment (10 - 15)
-        for i in 0..15 {
-            let payload = vec![i; 1024];
-            log.append(payload.len(), payload);
-        }
-
-        let mut data = Vec::new();
-
-        // Read a segment from start. This returns full segment
-        let next = log.readv((0, 0), &mut data).unwrap();
-        assert_eq!(next, (1, 10));
-
-        let next = log.readv(next, &mut data).unwrap();
-        assert_eq!(next, (1, 15));
-
-        // Write again
-        for i in 15..50 {
-            let payload = vec![i; 1024];
-            log.append(payload.len(), payload);
-        }
-
-        let next = log.readv(next, &mut data).unwrap();
-        assert_eq!(next, (2, 20));
-
-        let next = log.readv(next, &mut data).unwrap();
-        assert_eq!(next, (3, 30));
-
-        let next = log.readv(next, &mut data).unwrap();
-        assert_eq!(next, (4, 40));
-
-        let next = log.readv(next, &mut data).unwrap();
-        assert_eq!(next, (4, 50));
-
         let next = log.readv(next, &mut data);
+        assert_eq!(data.len(), 0);
         assert!(next.is_none());
     }
 
@@ -449,9 +444,12 @@ mod test {
 
         let mut data = Vec::new();
         let mut cursor = (0, 0);
+        let mut i = 0;
         while let Some(c) = log.readv(cursor, &mut data) {
+            assert_eq!(c.0, i);
             println!("progress = {:?}", c);
             cursor = c;
+            i += 1;
         }
     }
 }
