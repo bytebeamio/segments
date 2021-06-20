@@ -132,8 +132,6 @@ impl<T: Debug + Clone> MemoryLog<T> {
             return None;
         }
 
-        println!("{:?}", progress);
-
         // read from active segment if base offset matches active segment's base offset
         if progress.0 == self.tail.0 {
             let count = self.active_segment.readv(progress.1, out);
@@ -146,7 +144,6 @@ impl<T: Debug + Clone> MemoryLog<T> {
         }
 
         loop {
-            println!("{:?}", progress);
             // Read from backlog segments
             match self.segments.get(&progress.0) {
                 Some(segment) => {
@@ -446,6 +443,7 @@ mod test {
         let mut data = Vec::new();
         let mut cursor = (0, 0);
         while let Some(c) = log.readv(cursor, &mut data) {
+            println!("progress = {:?}", c);
             cursor = c;
         }
     }
