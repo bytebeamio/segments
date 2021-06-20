@@ -11,10 +11,10 @@ use std::mem;
 /// when ever current segment crosses disk limit
 #[derive(Debug)]
 pub struct MemoryLog<T> {
-    /// Offset of the first segment
-    head_offset: u64,
-    /// Offset of the last segment
-    tail_offset: u64,
+    /// First segment
+    head: (u64, u64),
+    /// Last segment
+    tail: (u64, u64),
     /// Maximum size of a segment
     max_segment_size: usize,
     /// Maximum number of segments
@@ -33,8 +33,8 @@ impl<T: Debug + Clone> MemoryLog<T> {
         }
 
         MemoryLog {
-            head_offset: 0,
-            tail_offset: 0,
+            head: (0, 0),
+            tail: (0, 0),
             max_segment_size,
             max_segments,
             segments: FnvHashMap::default(),
@@ -43,7 +43,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
     }
 
     pub fn head_and_tail(&self) -> (u64, u64) {
-        (self.head_offset, self.tail_offset)
+        (self.head.0, self.tail.0)
     }
 
     /// Appends this record to the tail and returns the offset of this append.
@@ -52,7 +52,7 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// This function also handles retention by removing head segment
     pub fn append(&mut self, size: usize, record: T) -> (u64, u64) {
         let switch = self.apply_retention();
-        let segment_id = self.tail_offset;
+        let segment_id = self.tail.0;
         let offset = self.active_segment.append(record, size);
 
         // For debugging during flux. Will be removed later
@@ -67,14 +67,21 @@ impl<T: Debug + Clone> MemoryLog<T> {
         if self.active_segment.size() >= self.max_segment_size {
             let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
             let last_active = mem::replace(&mut self.active_segment, Segment::new(next_offset));
-            self.segments.insert(self.tail_offset, last_active);
-            self.tail_offset += 1;
+            self.segments.insert(self.tail.0, last_active);
+
+            // Next tail
+            self.tail.0 += 1;
+            self.tail.1 = next_offset;
 
             // if backlog + active segment count is greater than max segments,
             // delete first segment and update head
             if self.segments.len() + 1 > self.max_segments {
-                if self.segments.remove(&self.head_offset).is_some() {
-                    self.head_offset += 1;
+                if let Some(segment) = self.segments.remove(&self.head.0) {
+                    let next_offset = segment.base_offset() + segment.len() as u64;
+
+                    // Next head
+                    self.head.0 += 1;
+                    self.head.1 = next_offset;
                 }
             }
 
@@ -85,14 +92,14 @@ impl<T: Debug + Clone> MemoryLog<T> {
     }
 
     pub fn next_offset(&self) -> (u64, u64) {
-        let segment_id = self.tail_offset;
+        let segment_id = self.tail.0;
         let next_offset = self.active_segment.base_offset() + self.active_segment.len() as u64;
         (segment_id, next_offset)
     }
 
     /// Read a record from correct segment
     pub fn read(&mut self, cursor: (u64, u64)) -> Option<T> {
-        if cursor.0 == self.tail_offset {
+        if cursor.0 == self.tail.0 {
             return self.active_segment.read(cursor.1);
         }
 
@@ -110,49 +117,74 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// data is not of active segment. Set your max_segment size keeping tail
     /// latencies of all the concurrent connections mind
     /// (some runtimes support internal preemption using await points)
-    pub fn readv(&mut self, mut cursor: (u64, u64), out: &mut Vec<T>) -> Option<(u64, u64)> {
+    pub fn readv(&mut self, cursor: (u64, u64), out: &mut Vec<T>) -> Option<(u64, u64)> {
+        let mut progress = cursor;
+
         // TODO Fix usize to u64 conversions
         // jump to head if the caller is trying to read deleted segment
-        if cursor.0 < self.head_offset {
+        if progress.0 < self.head.0 {
             warn!("Trying to read a deleted segment. Jumping");
-            cursor = (self.head_offset, self.head_offset)
+            progress = self.head;
         }
 
+        // TODO Cover case where progress.0 is > self.tail.0
+
+        // read from active segment if base offset matches active segment's base offset
+        if progress.0 == self.tail.0 {
+            let count = self.active_segment.readv(progress.1, out);
+            if count == 0 {
+                return None;
+            }
+
+            progress.1 += count as u64;
+            return Some(progress);
+        }
+
+        let mut reset_offset = false;
         loop {
-            // read from active segment if base offset matches active segment's base offset
-            if cursor.0 == self.tail_offset {
-                self.active_segment.readv(cursor.1, out);
-                // Return None if there is no data. Router will park the data request with
-                // this cursor to resume when there is more data
-                if out.is_empty() {
-                    break None;
-                }
-
-                cursor.1 += out.len() as u64;
-                break Some(cursor);
-            }
-
             // read from backlog segments
-            if let Some(segment) = self.segments.get(&cursor.0) {
-                segment.readv(cursor.1, out);
-
-                if !out.is_empty() {
-                    // We always read full segment. So we can always jump to next segment
-                    cursor.0 += 1;
-                    cursor.1 += out.len() as u64;
-                    break (Some(cursor));
-                } else {
-                    // Jump to the next segment if the above readv return 0 element
-                    // because of just being at the edge before next segment got
-                    // added
-                    // NOTE: This jump is necessary because, readv should always
-                    // return data if there is data. Or else router registers this
-                    // for notification even though there is data (which might
-                    // cause a block)
-                    cursor.0 += 1;
+            let segment = match self.segments.get(&progress.0) {
+                Some(s) => s,
+                None if progress.0 == self.tail.0 => {
+                    // If we are jumping to active segment reset offset to start of the segment
+                    reset_offset = true;
+                    &self.active_segment
+                }
+                None => {
+                    // If we are jumping to new segment reset offset to start of the segment
+                    reset_offset = true;
+                    progress.0 += 1;
                     continue;
-                };
+                }
+            };
+
+            if reset_offset {
+                reset_offset = false;
+                progress.1 = segment.base_offset();
             }
+
+            let count = segment.readv(progress.1, out);
+            if count > 0 {
+                // We always read full segment. So we can always jump to next segment
+                progress.0 += 1;
+                progress.1 += count as u64;
+                return Some(progress);
+            }
+
+            // If count is zero and current segment is tail
+            if progress.0 == self.tail.0 {
+                return None;
+            }
+
+            // Jump to the next segment if the above readv return 0 element
+            // because of just being at the edge before next segment got
+            // added
+            // NOTE: This jump is necessary because, readv should always
+            // return data if there is data. Or else router registers this
+            // for notification even though there is data (which might
+            // cause a block)
+            progress.0 += 1;
+            continue;
         }
     }
 }
@@ -353,6 +385,48 @@ mod test {
         let mut data = Vec::new();
         let next = log.readv(next.unwrap(), &mut data);
         assert_eq!(data.len(), 0);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn vectored_read_works_as_expected_2() {
+        let mut log = MemoryLog::new(10 * 1024, 100);
+
+        // 15 1K iterations. 1.5 files
+        // 0.segment (data with 0 - 9), 1.segment (10 - 15)
+        for i in 0..15 {
+            let payload = vec![i; 1024];
+            log.append(payload.len(), payload);
+        }
+
+        let mut data = Vec::new();
+
+        // Read a segment from start. This returns full segment
+        let next = log.readv((0, 0), &mut data).unwrap();
+        assert_eq!(next, (1, 10));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (1, 15));
+
+        // Write again
+        for i in 15..50 {
+            let payload = vec![i; 1024];
+            log.append(payload.len(), payload);
+        }
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (2, 20));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (3, 30));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (4, 40));
+
+        let next = log.readv(next, &mut data).unwrap();
+        assert_eq!(next, (4, 50));
+
+        let next = log.readv(next, &mut data);
         assert!(next.is_none());
     }
 }

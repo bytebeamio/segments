@@ -58,12 +58,19 @@ impl<T: Debug + Clone> Segment<T> {
     }
 
     /// Reads multiple data from an offset to the end of segment
-    pub fn readv(&self, offset: u64, out: &mut Vec<T>) {
+    pub fn readv(&self, offset: u64, out: &mut Vec<T>) -> usize {
+        println!(
+            "Sweep. Offset = {} Base offset = {}",
+            offset, self.base_offset
+        );
+
         if offset < self.base_offset {
-            return;
+            return 0;
         }
 
         let offset = offset - self.base_offset;
-        out.extend_from_slice(&self.file[offset as usize..])
+        let slice = &self.file[offset as usize..];
+        out.extend_from_slice(slice);
+        slice.len()
     }
 }
