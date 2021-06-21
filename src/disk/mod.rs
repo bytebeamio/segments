@@ -222,26 +222,24 @@ impl DiskHandler {
 
     /// Read a single packet from given offset in segment at given index.
     #[inline]
-    pub(super) fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&self, index: u64, offset: u64) -> io::Result<Option<Bytes>> {
         if let Some(chunk) = self.chunks.get(&index) {
             chunk.read(offset)
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("given index {} does not exists on disk", index).as_str(),
-            ))
+            Ok(None)
         }
     }
 
     #[inline]
-    pub(super) fn read_with_timestamps(&self, index: u64, offset: u64) -> io::Result<(Bytes, u64)> {
+    pub(super) fn read_with_timestamps(
+        &self,
+        index: u64,
+        offset: u64,
+    ) -> io::Result<Option<(Bytes, u64)>> {
         if let Some(chunk) = self.chunks.get(&index) {
             chunk.read_with_timestamps(offset)
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("given index {} does not exists on disk", index).as_str(),
-            ))
+            Ok(None)
         }
     }
 
@@ -287,16 +285,16 @@ impl DiskHandler {
         offset: u64,
         len: u64,
         out: &mut Vec<Bytes>,
-    ) -> io::Result<(u64, Option<u64>)> {
+    ) -> io::Result<Option<(u64, Option<u64>)>> {
         let chunk = if let Some(disk_segment) = self.chunks.get(&index) {
             disk_segment
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("given index {} does not exists on disk", index).as_str(),
-            ));
+            return Ok(None);
         };
-        let mut left = chunk.readv(offset, len, out)?;
+        let mut left = match chunk.readv(offset, len, out)? {
+            Some(ret) => ret,
+            None => return Ok(None),
+        };
 
         let mut segment_idx = index;
 
@@ -307,12 +305,12 @@ impl DiskHandler {
                 while self.chunks.get(&segment_idx).is_none() {
                     segment_idx += 1;
                     if segment_idx > self.tail {
-                        return Ok((left, None));
+                        return Ok(Some((left, None)));
                     }
                 }
             }
 
-            return Ok((0, Some(segment_idx as u64)));
+            return Ok(Some((0, Some(segment_idx as u64))));
         }
 
         while left > 0 {
@@ -320,17 +318,20 @@ impl DiskHandler {
             while self.chunks.get(&segment_idx).is_none() {
                 segment_idx += 1;
                 if segment_idx > self.tail {
-                    return Ok((left, None));
+                    return Ok(Some((left, None)));
                 }
             }
 
             // unwrap fine as we already validated the index in the while loop
-            left = self.chunks.get(&segment_idx).unwrap().readv(0, left, out)?;
+            left = match self.chunks.get(&segment_idx).unwrap().readv(0, left, out)? {
+                Some(ret) => ret,
+                None => return Ok(None),
+            };
         }
 
-        Ok((0, Some(segment_idx)))
+        Ok(Some((0, Some(segment_idx))))
 
-        // There are three possible cases for return of Ok(_):
+        // There are three possible cases for return of Ok(Some(_)):
         // 1.) len = 0, next = Some(_)
         //     => we still have segment left to read, but len reached
         // 2.) len = 0, next = None
@@ -350,16 +351,16 @@ impl DiskHandler {
         offset: u64,
         len: u64,
         out: &mut Vec<(Bytes, u64)>,
-    ) -> io::Result<(u64, Option<u64>)> {
+    ) -> io::Result<Option<(u64, Option<u64>)>> {
         let chunk = if let Some(chunk) = self.chunks.get(&index) {
             chunk
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("given index {} does not exists on disk", index).as_str(),
-            ));
+            return Ok(None);
         };
-        let mut left = chunk.readv_with_timestamps(offset, len, out)?;
+        let mut left = match chunk.readv_with_timestamps(offset, len, out)? {
+            Some(ret) => ret,
+            None => return Ok(None),
+        };
 
         let mut segment_idx = index;
 
@@ -370,12 +371,12 @@ impl DiskHandler {
                 while self.chunks.get(&segment_idx).is_none() {
                     segment_idx += 1;
                     if segment_idx > self.tail {
-                        return Ok((left, None));
+                        return Ok(Some((left, None)));
                     }
                 }
             }
 
-            return Ok((0, Some(segment_idx as u64)));
+            return Ok(Some((0, Some(segment_idx as u64))));
         }
 
         while left > 0 {
@@ -383,21 +384,25 @@ impl DiskHandler {
             while self.chunks.get(&segment_idx).is_none() {
                 segment_idx += 1;
                 if segment_idx > self.tail {
-                    return Ok((left, None));
+                    return Ok(Some((left, None)));
                 }
             }
 
             // unwrap fine as we already validated the index in the while loop
-            left = self
+            left = match self
                 .chunks
                 .get(&segment_idx)
                 .unwrap()
-                .readv_with_timestamps(0, left, out)?;
+                .readv_with_timestamps(0, left, out)?
+            {
+                Some(ret) => ret,
+                None => return Ok(None),
+            };
         }
 
-        Ok((0, Some(segment_idx)))
+        Ok(Some((0, Some(segment_idx))))
 
-        // There are three possible cases for return of Ok(_):
+        // There are three possible cases for return of Ok(Some(_)):
         // 1.) len = 0, next = Some(_)
         //     => we still have segment left to read, but len reached
         // 2.) len = 0, next = None
@@ -564,7 +569,7 @@ mod test {
         }
 
         let mut v = Vec::new();
-        let (mut left, mut ret) = handler.readv(0, 0, 10, &mut v).unwrap();
+        let (mut left, mut ret) = handler.readv(0, 0, 10, &mut v).unwrap().unwrap();
         verify_bytes_as_random_packets(v, 10);
         let mut offset = 0;
         let mut v: Vec<Bytes> = Vec::new();
@@ -572,7 +577,7 @@ mod test {
         while let Some(seg) = ret {
             v.clear();
             offset = if left > 0 { 0 } else { offset + 10 };
-            let (new_left, new_ret) = handler.readv(seg, offset, 10, &mut v).unwrap();
+            let (new_left, new_ret) = handler.readv(seg, offset, 10, &mut v).unwrap().unwrap();
             left = new_left;
             ret = new_ret;
         }

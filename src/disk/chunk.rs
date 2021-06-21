@@ -85,7 +85,8 @@ impl Chunk {
     /// the checksum of segment file and then comparing those two.
     pub(super) fn verify(&self, hasher: &mut impl Digest) -> io::Result<bool> {
         let read_hash = self.index.read_hash()?;
-        let read_segment = self.segment.read(0, self.segment.size())?;
+        // unwrap fine as we reading the exactly the len starting from 0.
+        let read_segment = self.segment.read(0, self.segment.size())?.unwrap();
         hasher.update(&read_segment);
         let calculated_hash = hasher.finalize_reset();
         Ok(calculated_hash.len() == read_hash.len()
@@ -97,7 +98,10 @@ impl Chunk {
 
     /// Read a packet from the disk segment at the particular index.
     #[inline]
-    pub(super) fn read(&self, index: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&self, index: u64) -> io::Result<Option<Bytes>> {
+        if index > self.index.entries() {
+            return Ok(None);
+        }
         let [offset, len] = self.index.read(index)?;
         self.segment.read(offset, len)
     }
@@ -105,18 +109,29 @@ impl Chunk {
     /// Read a packet from the disk segment at the particular index, and also retreive it's
     /// timestamp.
     #[inline]
-    pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<(Bytes, u64)> {
+    pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<Option<(Bytes, u64)>> {
+        if index > self.index.entries() {
+            return Ok(None)
+        }
         let [timestamp, offset, len] = self.index.read_with_timestamps(index)?;
-        Ok((self.segment.read(offset, len)?, timestamp))
+        Ok(Some((match self.segment.read(offset, len)? {
+            Some(ret) => ret,
+            // TODO: maybe we should let users know that index file is wrong, or maybe we should
+            // optimize this as unreachable.
+            None => return Ok(None),
+        }, timestamp)))
     }
 
     /// Read `len` packets from disk starting at `index`. If it is not possible to read `len`, it
     /// returns the number of bytes still left to read.
     #[inline]
-    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<Option<u64>> {
+        if index > self.index.entries() {
+            return Ok(None)
+        }
         let (offsets, left) = self.index.readv(index, len)?;
         self.segment.readv(offsets, out)?;
-        Ok(left)
+        Ok(Some(left))
     }
 
     /// Read `len` packets from disk starting at `index` as well as their timestamps. If it is not
@@ -127,10 +142,13 @@ impl Chunk {
         index: u64,
         len: u64,
         out: &mut Vec<(Bytes, u64)>,
-    ) -> io::Result<u64> {
+    ) -> io::Result<Option<u64>> {
+        if index > self.index.entries() {
+            return Ok(None)
+        }
         let (offsets, left) = self.index.readv_with_timestamps(index, len)?;
         self.segment.readv_with_timestamps(offsets, out)?;
-        Ok(left)
+        Ok(Some(left))
     }
 
     /// Get the index that corresponds to the given timestamp, and if exact match is not found then
@@ -177,14 +195,14 @@ mod test {
         assert!(chunk.verify(&mut hasher).unwrap());
 
         for i in 0..20u8 {
-            let byte = chunk.read(i as u64).unwrap();
+            let byte = chunk.read(i as u64).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
         }
 
         for i in 0..20u8 {
-            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap();
+            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
@@ -192,7 +210,7 @@ mod test {
         }
 
         let mut out = Vec::with_capacity(chunk.entries() as usize);
-        chunk.readv(0, chunk.entries(), &mut out).unwrap();
+        chunk.readv(0, chunk.entries(), &mut out).unwrap().unwrap();
 
         for (i, byte) in out.into_iter().enumerate() {
             assert_eq!(byte.len(), 1024);
@@ -230,14 +248,14 @@ mod test {
         assert!(chunk.verify(&mut hasher).unwrap());
 
         for i in 0..20u8 {
-            let byte = chunk.read(i as u64).unwrap();
+            let byte = chunk.read(i as u64).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
         }
 
         for i in 0..20u8 {
-            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap();
+            let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);

@@ -1,7 +1,4 @@
-use std::{
-    io,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
@@ -78,27 +75,21 @@ impl Segment {
 
     /// Get `Bytes` at the given index.
     #[inline]
-    pub(super) fn at(&self, index: u64) -> io::Result<Bytes> {
+    pub(super) fn at(&self, index: u64) -> Option<Bytes> {
         if index > self.len() {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("byte at offset {} not found", index).as_str(),
-            ))
+            None
         } else {
-            Ok(self.data[index as usize].0.clone())
+            Some(self.data[index as usize].0.clone())
         }
     }
 
     /// Get `Bytes` and the timestamp at the given index.
     #[inline]
-    pub(super) fn at_with_timestamp(&self, index: u64) -> io::Result<(Bytes, u64)> {
+    pub(super) fn at_with_timestamp(&self, index: u64) -> Option<(Bytes, u64)> {
         if index > self.len() {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("byte at offset {} not found", index).as_str(),
-            ))
+            None
         } else {
-            Ok(self.data[index as usize].clone())
+            Some(self.data[index as usize].clone())
         }
     }
 
@@ -143,12 +134,9 @@ impl Segment {
 
     /// Read a range of data into `out`, doesn't add timestamp.
     #[inline]
-    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<u64> {
+    pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> Option<u64> {
         if index >= self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("byte at offset {} not found", index).as_str(),
-            ));
+            return None
         }
 
         let mut limit = (index + len) as usize;
@@ -158,7 +146,7 @@ impl Segment {
             limit = self.data.len();
         }
         out.extend(self.data[index as usize..limit].iter().map(|x| x.0.clone()));
-        Ok(left as u64)
+        Some(left as u64)
     }
 
     /// Read a range of data into `out`, along with timestamp.
@@ -168,12 +156,9 @@ impl Segment {
         index: u64,
         len: u64,
         out: &mut Vec<(Bytes, u64)>,
-    ) -> io::Result<u64> {
+    ) -> Option<u64> {
         if index >= self.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("byte at offset {} not found", index).as_str(),
-            ));
+            return None
         }
 
         let mut limit = (index + len) as usize;
@@ -183,6 +168,6 @@ impl Segment {
             limit = self.data.len();
         }
         out.extend_from_slice(&self.data[index as usize..limit]);
-        Ok(left as u64)
+        Some(left as u64)
     }
 }

@@ -52,17 +52,9 @@ impl Segment {
 
     /// Reads `len` bytes from given `offset` in the file.
     #[inline]
-    pub(super) fn read(&self, offset: u64, len: u64) -> io::Result<Bytes> {
+    pub(super) fn read(&self, offset: u64, len: u64) -> io::Result<Option<Bytes>> {
         if offset + len > self.size {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "given offset + len = {} when file size is {}",
-                    offset + len,
-                    self.size
-                )
-                .as_str(),
-            ));
+            return Ok(None);
         }
         let len = len as usize;
         let mut bytes = BytesMut::with_capacity(len);
@@ -70,7 +62,7 @@ impl Segment {
         unsafe { bytes.set_len(len) };
         self.read_at(&mut bytes, offset)?;
 
-        Ok(bytes.freeze())
+        Ok(Some(bytes.freeze()))
     }
 
     /// Get packets from given vector of indices and corresponding lens.
@@ -83,10 +75,14 @@ impl Segment {
             }
             total
         } else {
+            // return empty if offsets given is empty.
             return Ok(());
         };
 
-        let mut buf = self.read(offsets[0][0], total)?;
+        let mut buf = match self.read(offsets[0][0], total)? {
+            Some(buf) => buf,
+            None => return Ok(()),
+        };
 
         for offset in offsets.into_iter() {
             out.push(buf.split_to(offset[1] as usize));
@@ -113,7 +109,10 @@ impl Segment {
             return Ok(());
         };
 
-        let mut buf = self.read(offsets[0][1], total)?;
+        let mut buf = match self.read(offsets[0][1], total)? {
+            Some(ret) => ret,
+            None => return Ok(()),
+        };
 
         for offset in offsets.into_iter() {
             out.push((buf.split_to(offset[2] as usize), offset[0]));
@@ -215,7 +214,7 @@ mod test {
 
         assert_eq!(segment.actual_size().unwrap(), 20 * 1024);
         for i in 0..20u8 {
-            let byte = segment.read(i as u64 * 1024, 1024).unwrap();
+            let byte = segment.read(i as u64 * 1024, 1024).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
@@ -247,7 +246,7 @@ mod test {
 
         assert_eq!(segment.actual_size().unwrap(), 20 * 1024);
         for i in 0..20u8 {
-            let byte = segment.read(i as u64 * 1024, 1024).unwrap();
+            let byte = segment.read(i as u64 * 1024, 1024).unwrap().unwrap();
             assert_eq!(byte.len(), 1024);
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);

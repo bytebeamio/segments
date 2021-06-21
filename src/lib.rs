@@ -7,8 +7,8 @@ mod segment;
 use disk::DiskHandler;
 use segment::Segment;
 
-// asdsa
-/// asdsadsa
+// TODO: write tests for cases when we read stuff that does not exist yet, and thus Ok(None) should
+// be written. Write such tests for each level of abstraction.
 
 /// The log which can store commits in memory, and push them onto disk when needed, as well as read
 /// from disk any valid segment. See [`Self::new`] for more information on how exactly log is
@@ -169,12 +169,9 @@ impl CommitLog {
     }
 
     /// Read a single [`Bytes`] from the logs.
-    pub fn read(&self, index: u64, offset: u64) -> io::Result<Bytes> {
+    pub fn read(&self, index: u64, offset: u64) -> io::Result<Option<Bytes>> {
         if index > self.tail {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         // in disk
@@ -183,28 +180,26 @@ impl CommitLog {
                 return handler.read(index, offset);
             }
 
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         // in memory segment
         if index < self.tail {
             let segment = &self.segments[(index - self.head) as usize];
-            return segment.at(index);
+            return Ok(segment.at(index));
         }
 
         // in active segment
-        self.active_segment.at(index)
+        Ok(self.active_segment.at(index))
     }
 
-    pub fn read_with_timestamps(&self, index: u64, offset: u64) -> io::Result<(Bytes, u64)> {
+    pub fn read_with_timestamps(
+        &self,
+        index: u64,
+        offset: u64,
+    ) -> io::Result<Option<(Bytes, u64)>> {
         if index > self.tail {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         // in disk
@@ -213,20 +208,17 @@ impl CommitLog {
                 return handler.read_with_timestamps(index, offset);
             }
 
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         // in memory segment
         if index < self.tail {
             let segment = &self.segments[(index - self.head) as usize];
-            return segment.at_with_timestamp(index);
+            return Ok(segment.at_with_timestamp(index));
         }
 
         // in active segment
-        self.active_segment.at_with_timestamp(index)
+        Ok(self.active_segment.at_with_timestamp(index))
     }
 
     /// Read vector of [`Bytes`] from the logs. Returns a tuple as follows:
@@ -246,12 +238,9 @@ impl CommitLog {
         mut index: u64,
         mut offset: u64,
         len: u64,
-    ) -> io::Result<(Vec<Bytes>, u64, u64, u64)> {
+    ) -> io::Result<Option<(Vec<Bytes>, u64, u64, u64)>> {
         if index > self.tail {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         let mut remaining_len = len;
@@ -260,7 +249,10 @@ impl CommitLog {
         if index < self.head {
             if let Some(handler) = self.disk_handler.as_ref() {
                 let (new_len, next_index) =
-                    handler.readv(index, offset, remaining_len, &mut out)?;
+                    match handler.readv(index, offset, remaining_len, &mut out)? {
+                        Some(ret) => ret,
+                        None => return Ok(None),
+                    };
 
                 remaining_len = new_len;
                 // start reading from memory in next iteration if no segment left to read on
@@ -269,20 +261,20 @@ impl CommitLog {
                 // start from beginning of next segment
                 offset = 0;
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("segment with given index {} not found", index).as_str(),
-                ));
+                return Ok(None);
             }
         }
 
         if remaining_len == 0 {
-            return Ok((out, remaining_len, index, offset));
+            return Ok(Some((out, remaining_len, index, offset)));
         }
 
         if index < self.tail {
             let segment = &self.segments[index as usize];
-            remaining_len = segment.readv(offset, remaining_len, &mut out)?;
+            remaining_len = match segment.readv(offset, remaining_len, &mut out) {
+                Some(rem_len) => rem_len,
+                None => return Ok(None),
+            };
             // read the next segment, or move onto the active segment
             index += 1;
             // start from beginning of next segment
@@ -290,12 +282,15 @@ impl CommitLog {
         }
 
         if remaining_len == 0 {
-            return Ok((out, remaining_len, index, offset));
+            return Ok(Some((out, remaining_len, index, offset)));
         }
 
-        remaining_len = self.active_segment.readv(offset, remaining_len, &mut out)?;
+        remaining_len = match self.active_segment.readv(offset, remaining_len, &mut out) {
+            Some(rem_len) => rem_len,
+            None => return Ok(None),
+        };
 
-        Ok((out, remaining_len, index, offset))
+        Ok(Some((out, remaining_len, index, offset)))
     }
 
     pub fn readv_with_timestamps(
@@ -303,12 +298,9 @@ impl CommitLog {
         mut index: u64,
         mut offset: u64,
         len: u64,
-    ) -> io::Result<(Vec<(Bytes, u64)>, u64, u64, u64)> {
+    ) -> io::Result<Option<(Vec<(Bytes, u64)>, u64, u64, u64)>> {
         if index > self.tail {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("segment with given index {} not found", index).as_str(),
-            ));
+            return Ok(None);
         }
 
         let mut remaining_len = len;
@@ -317,7 +309,10 @@ impl CommitLog {
         if index < self.head {
             if let Some(handler) = self.disk_handler.as_ref() {
                 let (new_len, next_index) =
-                    handler.readv_with_timestamps(index, offset, remaining_len, &mut out)?;
+                    match handler.readv_with_timestamps(index, offset, remaining_len, &mut out)? {
+                        Some(ret) => ret,
+                        None => return Ok(None),
+                    };
 
                 remaining_len = new_len;
                 // start reading from memory in next iteration if no segment left to read on
@@ -326,20 +321,20 @@ impl CommitLog {
                 // start from beginning of next segment
                 offset = 0;
             } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("segment with given index {} not found", index).as_str(),
-                ));
+                return Ok(None);
             }
         }
 
         if remaining_len == 0 {
-            return Ok((out, remaining_len, index, offset));
+            return Ok(Some((out, remaining_len, index, offset)));
         }
 
         if index < self.tail {
             let segment = &self.segments[index as usize];
-            remaining_len = segment.readv_with_timestamps(offset, remaining_len, &mut out)?;
+            remaining_len = match segment.readv_with_timestamps(offset, remaining_len, &mut out) {
+                Some(ret) => ret,
+                None => return Ok(None),
+            };
             // read the next segment, or move onto the active segment
             index += 1;
             // start from beginning of next segment
@@ -347,82 +342,70 @@ impl CommitLog {
         }
 
         if remaining_len == 0 {
-            return Ok((out, remaining_len, index, offset));
+            return Ok(Some((out, remaining_len, index, offset)));
         }
 
         remaining_len =
-            self.active_segment
-                .readv_with_timestamps(offset, remaining_len, &mut out)?;
+            match self.active_segment
+            .readv_with_timestamps(offset, remaining_len, &mut out) {
+                Some(ret) => ret,
+                None => return Ok(None)
+            };
 
-        Ok((out, remaining_len, index, offset))
+        Ok(Some((out, remaining_len, index, offset)))
     }
 
-    pub fn index_from_timestamp(&self, timestamp: u64) -> io::Result<(u64, u64)> {
+    pub fn index_from_timestamp(&self, timestamp: u64) -> io::Result<Option<(u64, u64)>> {
         // beyond even active segment
         if self.active_segment.end_time() < timestamp {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("timestamp {} not contained by any segment", timestamp).as_str(),
-            ));
+            return Ok(None);
         }
 
         if self.active_segment.start_time() <= timestamp {
             // found within active segment
-            return Ok((
+            return Ok(Some((
                 self.tail,
                 self.active_segment.index_from_timestamp(timestamp),
-            ));
+            )));
         }
 
         if self.segments.len() > 0 && self.segments.front().unwrap().start_time() <= timestamp {
             for (i, segment) in self.segments.iter().enumerate() {
                 if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
                     // found within segment in memory
-                    return Ok((
+                    return Ok(Some((
                         i as u64 + self.head,
                         segment.index_from_timestamp(timestamp),
-                    ));
+                    )));
                 }
             }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("timestamp {} not contained by any segment", timestamp).as_str(),
-            ));
+            return Ok(None);
         }
 
         let disk_handler = match self.disk_handler.as_ref() {
             Some(disk_handler) => disk_handler,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("timestamp {} not contained by any segment", timestamp).as_str(),
-                ))
-            }
+            None => return Ok(None),
         };
 
         if !disk_handler.is_timestamp_contained(timestamp) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("timestamp {} not contained by any segment", timestamp).as_str(),
-            ));
+            return Ok(None);
         }
 
-        disk_handler.index_from_timestamp(timestamp)
+        disk_handler
+            .index_from_timestamp(timestamp)
+            .map(|ret| Some(ret))
     }
 
-    pub fn read_from_timestamp(&self, timestamp: u64) -> io::Result<(Bytes, u64)> {
+    pub fn read_from_timestamp(&self, timestamp: u64) -> io::Result<Option<(Bytes, u64)>> {
         // beyond even active segment
         if self.active_segment.end_time() < timestamp {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("timestamp {} not contained by any segment", timestamp).as_str(),
-            ));
+            return Ok(None);
         }
 
         if self.active_segment.start_time() <= timestamp {
             // found within active segment
             let idx = self.active_segment.index_from_timestamp(timestamp);
-            return self.active_segment.at_with_timestamp(idx);
+            return Ok(self.active_segment.at_with_timestamp(idx));
         }
 
         if self.segments.len() > 0 && self.segments[0].start_time() >= timestamp {
@@ -430,26 +413,18 @@ impl CommitLog {
                 if segment.start_time() <= timestamp && timestamp <= segment.end_time() {
                     // found within segment in memory
                     let idx = segment.index_from_timestamp(timestamp);
-                    return segment.at_with_timestamp(idx);
+                    return Ok(segment.at_with_timestamp(idx));
                 }
             }
         }
 
         let disk_handler = match self.disk_handler.as_ref() {
             Some(disk_handler) => disk_handler,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("timestamp {} not contained by any segment", timestamp).as_str(),
-                ))
-            }
+            None => return Ok(None),
         };
 
         if !disk_handler.is_timestamp_contained(timestamp) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("timestamp {} not contained by any segment", timestamp).as_str(),
-            ));
+            return Ok(None);
         }
 
         let (segment_idx, offset) = disk_handler.index_from_timestamp(timestamp)?;
@@ -640,7 +615,7 @@ mod test {
         let mut offset = 0;
         let mut index = 0;
         for _ in 0..100 {
-            let v = log.readv(index, offset, 16).unwrap();
+            let v = log.readv(index, offset, 16).unwrap().unwrap();
             index = v.1;
             offset = v.2;
             verify_bytes_as_random_packets(v.0, 16);
@@ -674,6 +649,7 @@ mod test {
                 for k in 0..ranpack_bytes.len() as u64 - 1 {
                     let idx = log
                         .index_from_timestamp(i * 10000 + j * 1000 + k * 10 + 5)
+                        .unwrap()
                         .unwrap();
                     assert_eq!(idx.0, i);
                     assert_eq!(idx.1, j * 16 + k + 1);

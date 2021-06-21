@@ -151,6 +151,7 @@ impl Index {
     /// Get the offset, size of packet at the given index, using the index file.
     #[inline]
     pub(super) fn read(&self, index: u64) -> io::Result<[u64; 2]> {
+        // NOTE: out of length reads are handled by `Chunks::read`.
         let mut buf: [u8; 16] = unsafe { MaybeUninit::uninit().assume_init() };
         self.read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index + TIMESTAMP_SIZE)?;
         // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
@@ -161,6 +162,7 @@ impl Index {
     /// index file.
     #[inline]
     pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<[u64; 3]> {
+        // NOTE: out of length reads are handled by `Chunks::read_with_timestamps`.
         let mut buf: [u8; 24] = unsafe { MaybeUninit::uninit().assume_init() };
         self.read_at(&mut buf, HASH_SIZE + ENTRY_SIZE * index)?;
         // SAFETY: we are reading the same number of bytes, and we write in exact same manner.
@@ -173,6 +175,7 @@ impl Index {
 
     #[inline]
     pub(super) fn readv(&self, index: u64, len: u64) -> io::Result<(Vec<[u64; 2]>, u64)> {
+        // NOTE: out of length reads are handled by `Chunks::readv`.
         self.readv_with_timestamps(index, len).map(|(v, left)| {
             (
                 v.into_iter()
@@ -193,6 +196,7 @@ impl Index {
         index: u64,
         len: u64,
     ) -> io::Result<(Vec<[u64; 3]>, u64)> {
+        // NOTE: out of length reads are handled by `Chunks::readv_with_timestamps`.
         let limit = index + len;
         let (left, len) = if limit > self.entries {
             (
