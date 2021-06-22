@@ -99,7 +99,7 @@ impl Chunk {
     /// Read a packet from the disk segment at the particular index.
     #[inline]
     pub(super) fn read(&self, index: u64) -> io::Result<Option<Bytes>> {
-        if index > self.index.entries() {
+        if index >= self.index.entries() {
             return Ok(None);
         }
         let [offset, len] = self.index.read(index)?;
@@ -110,7 +110,7 @@ impl Chunk {
     /// timestamp.
     #[inline]
     pub(super) fn read_with_timestamps(&self, index: u64) -> io::Result<Option<(Bytes, u64)>> {
-        if index > self.index.entries() {
+        if index >= self.index.entries() {
             return Ok(None)
         }
         let [timestamp, offset, len] = self.index.read_with_timestamps(index)?;
@@ -126,7 +126,7 @@ impl Chunk {
     /// returns the number of bytes still left to read.
     #[inline]
     pub(super) fn readv(&self, index: u64, len: u64, out: &mut Vec<Bytes>) -> io::Result<Option<u64>> {
-        if index > self.index.entries() {
+        if index >= self.index.entries() {
             return Ok(None)
         }
         let (offsets, left) = self.index.readv(index, len)?;
@@ -143,7 +143,7 @@ impl Chunk {
         len: u64,
         out: &mut Vec<(Bytes, u64)>,
     ) -> io::Result<Option<u64>> {
-        if index > self.index.entries() {
+        if index >= self.index.entries() {
             return Ok(None)
         }
         let (offsets, left) = self.index.readv_with_timestamps(index, len)?;
@@ -200,6 +200,7 @@ mod test {
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
         }
+        assert_eq!(chunk.read(20).unwrap(), None);
 
         for i in 0..20u8 {
             let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap().unwrap();
@@ -208,9 +209,11 @@ mod test {
             assert_eq!(byte[1023], i);
             assert_eq!(timestamp, i as u64 * 100);
         }
+        assert_eq!(chunk.read_with_timestamps(20).unwrap(), None);
 
         let mut out = Vec::with_capacity(chunk.entries() as usize);
         chunk.readv(0, chunk.entries(), &mut out).unwrap().unwrap();
+        assert_eq!(chunk.readv(20, 1, &mut out).unwrap(), None);
 
         for (i, byte) in out.into_iter().enumerate() {
             assert_eq!(byte.len(), 1024);
@@ -220,6 +223,7 @@ mod test {
 
         let mut out = Vec::with_capacity(chunk.entries() as usize);
         chunk.readv_with_timestamps(0, chunk.entries(), &mut out).unwrap();
+        assert_eq!(chunk.readv_with_timestamps(20, 1, &mut out).unwrap(), None);
 
         for (i, (byte, timestamp)) in out.into_iter().enumerate() {
             assert_eq!(byte.len(), 1024);
@@ -253,6 +257,7 @@ mod test {
             assert_eq!(byte[0], i);
             assert_eq!(byte[1023], i);
         }
+        assert_eq!(chunk.read(20).unwrap(), None);
 
         for i in 0..20u8 {
             let (byte, timestamp) = chunk.read_with_timestamps(i as u64).unwrap().unwrap();
@@ -261,9 +266,11 @@ mod test {
             assert_eq!(byte[1023], i);
             assert_eq!(timestamp, i as u64 * 100);
         }
+        assert_eq!(chunk.read_with_timestamps(20).unwrap(), None);
 
         let mut out = Vec::with_capacity(chunk.entries() as usize);
         chunk.readv(0, chunk.entries(), &mut out).unwrap();
+        assert_eq!(chunk.readv(20, 1, &mut out).unwrap(), None);
 
         for (i, byte) in out.into_iter().enumerate() {
             assert_eq!(byte.len(), 1024);
@@ -273,6 +280,7 @@ mod test {
 
         let mut out = Vec::with_capacity(chunk.entries() as usize);
         chunk.readv_with_timestamps(0, chunk.entries(), &mut out).unwrap();
+        assert_eq!(chunk.readv_with_timestamps(20, 1, &mut out).unwrap(), None);
 
         for (i, (byte, timestamp)) in out.into_iter().enumerate() {
             assert_eq!(byte.len(), 1024);

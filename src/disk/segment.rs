@@ -206,6 +206,7 @@ mod test {
         let dir = tempdir().unwrap();
 
         let mut buf = BytesMut::new();
+        // 1024 * 20 bytes stored.
         for i in 0..20u8 {
             buf.put(Bytes::from(vec![i; 1024]));
         }
@@ -231,6 +232,9 @@ mod test {
             assert_eq!(byte[0], i as u8);
             assert_eq!(byte[1023], i as u8);
         }
+
+        assert_eq!(segment.read(1024 * 20, 1024).unwrap(), None);
+        assert_eq!(segment.read(1024 * 21, 1024).unwrap(), None);
     }
 
     #[test]
@@ -266,5 +270,8 @@ mod test {
             assert_eq!(byte[0], i as u8);
             assert_eq!(byte[1023], i as u8);
         }
+
+        assert_eq!(segment.read(1024 * 20, 1024).unwrap(), None);
+        assert_eq!(segment.read(1024 * 21, 1024).unwrap(), None);
     }
 }

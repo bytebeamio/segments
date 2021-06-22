@@ -489,6 +489,11 @@ mod test {
                 assert_eq!(elem.1, i * 100);
             }
         }
+
+        let mut v = Vec::new();
+        assert_eq!(handler.readv(20, 0, 1, &mut v).unwrap(), None);
+        let mut v = Vec::new();
+        assert_eq!(handler.readv_with_timestamps(20, 0, 1, &mut v).unwrap(), None);
     }
 
     #[test]
@@ -583,6 +588,11 @@ mod test {
         }
 
         assert_eq!(left, 0);
+
+        let mut v = Vec::new();
+        assert_eq!(handler.readv(15, 0, 1, &mut v).unwrap(), None);
+        let mut v = Vec::new();
+        assert_eq!(handler.readv_with_timestamps(15, 0, 1, &mut v).unwrap(), None);
     }
 
     #[test]
