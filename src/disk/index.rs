@@ -53,7 +53,13 @@ impl Index {
     #[inline]
     pub(super) fn open<P: AsRef<Path>>(path: P) -> io::Result<(Self, u64, u64)> {
         let file = OpenOptions::new().read(true).open(path)?;
-        let entries = (file.metadata()?.len() - HASH_SIZE) / ENTRY_SIZE;
+        let len = file.metadata()?.len();
+
+        let entries = if len <= HASH_SIZE {
+            0
+        } else {
+            (file.metadata()?.len() - HASH_SIZE) / ENTRY_SIZE
+        };
 
         let mut index = Self {
             file,
@@ -337,9 +343,12 @@ mod test {
 
         drop(index);
 
-        let (index, _, _) = Index::open(dir.path().join(format!("{:020}", 2).as_str())).unwrap();
+        let (index, start_time, end_time) =
+            Index::open(dir.path().join(format!("{:020}", 2).as_str())).unwrap();
         assert_eq!(index.read(19).unwrap(), [2800, 200]);
         assert_eq!(index.read_hash().unwrap(), [2; 32]);
+        assert_eq!(start_time, 1);
+        assert_eq!(end_time, 20);
 
         let (v, _) = index.readv_with_timestamps(0, 20).unwrap();
         for i in 0..10 {
@@ -352,6 +361,48 @@ mod test {
             assert_eq!(v[i][1] as usize, 1000 + 200 * (i - 10)); // offset
             assert_eq!(v[i][2], 200); // len
         }
+    }
+
+    #[test]
+    fn open_empty_index() {
+        let dir = tempdir().unwrap();
+
+        // creating an empty index file.
+        let index_path = dir.path().join(format!("{:020}", 10).as_str());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(index_path.clone())
+            .unwrap();
+
+        let (index, start_time, end_time) = Index::open(index_path).unwrap();
+        assert_eq!(start_time, 0);
+        assert_eq!(end_time, 0);
+        assert!(index.read(0).is_err());
+        assert!(index.read(1).is_err());
+    }
+
+    #[test]
+    fn new_and_open_index() {
+        let dir = tempdir().unwrap();
+
+        let index_path = dir.path().join(format!("{:020}", 10).as_str());
+        let index = Index::new(
+            index_path.clone(),
+            b"12345678123456781234567812345678",
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(index.start_time, 0);
+        assert_eq!(index.end_time, 0);
+        drop(index);
+
+        let (index, _, _) = Index::open(index_path).unwrap();
+        assert_eq!(index.head_time(), 0);
+        assert_eq!(index.tail_time(), 0);
+        assert_eq!(&index.read_hash().unwrap(), b"12345678123456781234567812345678");
+        assert!(index.read(0).is_err());
+        assert!(index.read(1).is_err());
     }
 
     #[test]
