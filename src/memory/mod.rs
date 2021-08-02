@@ -46,6 +46,10 @@ impl<T: Debug + Clone> MemoryLog<T> {
         (self.head.0, self.tail.0)
     }
 
+    pub fn tail(&self) -> (u64, u64) {
+        self.tail
+    }
+
     /// Appends this record to the tail and returns the offset of this append.
     /// When the current segment is full, this also create a new segment and
     /// writes the record to it.
