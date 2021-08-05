@@ -46,8 +46,15 @@ impl<T: Debug + Clone> MemoryLog<T> {
         (self.head.0, self.tail.0)
     }
 
-    pub fn tail(&self) -> (u64, u64) {
-        self.tail
+    pub fn last(&self) -> (u64, u64) {
+        let a = self.active_segment.base_offset();
+        let b = self.active_segment.len() as u64;
+
+        if b == 0 {
+            return (a, 0)
+        }
+
+        (a, b - 1)
     }
 
     /// Appends this record to the tail and returns the offset of this append.
@@ -56,8 +63,10 @@ impl<T: Debug + Clone> MemoryLog<T> {
     /// This function also handles retention by removing head segment
     pub fn append(&mut self, size: usize, record: T) -> (u64, u64) {
         let switch = self.apply_retention();
-        let segment_id = self.tail.0;
         let offset = self.active_segment.append(record, size);
+        let segment_id = self.tail.0;
+
+        self.tail.1 = offset;
 
         // For debugging during flux. Will be removed later
         if switch {
