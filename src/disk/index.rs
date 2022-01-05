@@ -1,5 +1,5 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use memmap::MmapMut;
+use memmap2::MmapMut;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
